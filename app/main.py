@@ -98,6 +98,36 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.warning("ContextRetrieverAgent: disabled (Qdrant unavailable)")
     app.state.context_retriever = context_retriever
 
+    # ── A-MEM Service ──────────────────────────────────────────────────────────
+    from app.services.amem_service import AMEMService
+    amem_service = AMEMService(db=mongo_db)
+    try:
+        await amem_service.init()
+        count = await amem_service.memory_count()
+        logger.info("AMEMService: ready ({} notes in memory)", count)
+    except Exception as exc:
+        logger.warning("AMEMService init failed (non-fatal): {}", exc)
+        amem_service = None
+    app.state.amem = amem_service
+
+    # ── Letta Service ──────────────────────────────────────────────────────────
+    from app.services.letta_service import LettaService
+    letta_service = LettaService(db=mongo_db)
+    await letta_service.init()
+    app.state.letta = letta_service
+
+    # ── Root Cause Reasoner Agent ──────────────────────────────────────────────
+    from app.agents.root_cause_reasoner import RootCauseReasonerAgent
+    reasoner = RootCauseReasonerAgent(
+        amem=amem_service,
+        letta=letta_service,
+        groq_api_key=os.getenv("GROQ_API_KEY"),
+        reasoning_model=os.getenv("GROQ_MODEL_REASONING", "deepseek-r1-distill-llama-70b"),
+        fast_model=os.getenv("GROQ_MODEL_FAST", "llama-3.1-8b-instant"),
+    )
+    app.state.reasoner = reasoner
+    logger.info("RootCauseReasonerAgent: ready")
+
     # ── WebSocket Connection Manager ───────────────────────────────────────────
     from app.api.routes.sensors import ConnectionManager
     app.state.ws_manager = ConnectionManager()
@@ -139,12 +169,15 @@ def create_app() -> FastAPI:
     @app.get("/health", tags=["health"])
     async def health() -> dict:
         return {
-            "status": "ok",
-            "ml_ready": app.state.ml.is_ready,
-            "redis_connected": app.state.redis.is_connected,
-            "mongo_connected": app.state.mongo_db is not None,
+            "status":           "ok",
+            "ml_ready":         app.state.ml.is_ready,
+            "redis_connected":  app.state.redis.is_connected,
+            "mongo_connected":  app.state.mongo_db is not None,
             "qdrant_connected": app.state.qdrant is not None,
-            "rag_ready": app.state.context_retriever is not None,
+            "rag_ready":        app.state.context_retriever is not None,
+            "amem_ready":       app.state.amem is not None,
+            "letta_ready":      app.state.letta.is_ready,
+            "reasoner_ready":   True,
         }
 
     return app
