@@ -5,8 +5,9 @@ Startup sequence:
   1. Load ML models (LSTM Autoencoder + Isolation Forest)
   2. Connect to Redis
   3. Connect to MongoDB (optional — degrades gracefully if unavailable)
-  4. Wire up AnomalyDetectorAgent with all services
-  5. Mount API routers
+  4. Connect to Qdrant + load embedding model (optional)
+  5. Wire up AnomalyDetectorAgent + ContextRetrieverAgent
+  6. Mount API routers
 
 Run:
     uvicorn app.main:app --port 8080 --reload
@@ -65,6 +66,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("MongoDB: MONGODB_URL not set — skipping (set it in .env)")
     app.state.mongo_db = mongo_db
 
+    # ── Qdrant Service (optional) ──────────────────────────────────────────────
+    from app.services.qdrant_service import QdrantService
+    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    qdrant_key = os.getenv("QDRANT_API_KEY") or None
+    qdrant_service = QdrantService(url=qdrant_url, api_key=qdrant_key)
+    try:
+        await qdrant_service.init()
+        logger.info("Qdrant: connected and embedding model loaded")
+    except Exception as exc:
+        logger.warning("Qdrant unavailable — RAG context disabled: {}", exc)
+        qdrant_service = None
+    app.state.qdrant = qdrant_service
+
     # ── Anomaly Detector Agent ─────────────────────────────────────────────────
     from app.agents.anomaly_detector import AnomalyDetectorAgent
     detector = AnomalyDetectorAgent(
@@ -73,6 +87,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         mongo_db=mongo_db,
     )
     app.state.detector = detector
+
+    # ── Context Retriever Agent ────────────────────────────────────────────────
+    from app.agents.context_retriever import ContextRetrieverAgent
+    if qdrant_service is not None:
+        context_retriever = ContextRetrieverAgent(qdrant=qdrant_service, redis=redis_service)
+        logger.info("ContextRetrieverAgent: ready")
+    else:
+        context_retriever = None
+        logger.warning("ContextRetrieverAgent: disabled (Qdrant unavailable)")
+    app.state.context_retriever = context_retriever
 
     # ── WebSocket Connection Manager ───────────────────────────────────────────
     from app.api.routes.sensors import ConnectionManager
@@ -119,6 +143,8 @@ def create_app() -> FastAPI:
             "ml_ready": app.state.ml.is_ready,
             "redis_connected": app.state.redis.is_connected,
             "mongo_connected": app.state.mongo_db is not None,
+            "qdrant_connected": app.state.qdrant is not None,
+            "rag_ready": app.state.context_retriever is not None,
         }
 
     return app
