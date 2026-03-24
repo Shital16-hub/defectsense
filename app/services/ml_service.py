@@ -106,7 +106,12 @@ class MLService:
 
         if IFOREST_PATH.exists():
             with open(IFOREST_PATH, "rb") as f:
-                self._iforest = pickle.load(f)
+                iforest_data = pickle.load(f)
+            # pkl was saved as a dict: {"model": ..., "scaler": ..., ...}
+            if isinstance(iforest_data, dict):
+                self._iforest = iforest_data["model"]
+            else:
+                self._iforest = iforest_data
             logger.info("  ✓ Isolation Forest loaded")
         else:
             logger.warning("  ✗ Isolation Forest not found — run ml/train_isolation_forest.py")
@@ -210,10 +215,8 @@ class MLService:
             isolation_score=iforest_score,
         )
 
-        # Log to MLflow asynchronously (don't block the response)
-        asyncio.create_task(
-            loop.run_in_executor(self._executor, self._log_to_mlflow, result)
-        )
+        # Log to MLflow in background thread (run_in_executor returns a Future, not a coroutine)
+        loop.run_in_executor(self._executor, self._log_to_mlflow, result)
 
         return result
 
