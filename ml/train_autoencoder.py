@@ -146,7 +146,7 @@ def main() -> None:
     print()
 
     # ── MLflow Tracking ───────────────────────────────────────────────────────
-    mlflow.set_tracking_uri(str(ROOT / "mlruns"))
+    mlflow.set_tracking_uri("./mlruns")
     mlflow.set_experiment("defectsense_anomaly_detection")
 
     with mlflow.start_run(run_name="lstm_autoencoder"):
