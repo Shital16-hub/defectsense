@@ -6,14 +6,17 @@ Startup sequence:
   2. Connect to Redis
   3. Connect to MongoDB (optional — degrades gracefully if unavailable)
   4. Connect to Qdrant + load embedding model (optional)
-  5. Wire up AnomalyDetectorAgent + ContextRetrieverAgent
-  6. Mount API routers
+  5. Wire up agents: AnomalyDetector, ContextRetriever, A-MEM, Letta,
+                     RootCauseReasoner, AlertGenerator, Orchestrator
+  6. Mount API routers + WebSocket hub
+  7. Start background timeout checker
 
 Run:
     uvicorn app.main:app --port 8080 --reload
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -24,6 +27,73 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 load_dotenv()
+
+# ── Background task: approval timeout checker ──────────────────────────────────
+
+_pending_threads: dict[str, str] = {}  # thread_id → ISO timeout datetime
+
+
+async def _approval_timeout_loop(app: FastAPI) -> None:
+    """Check pending alerts every 60 s; auto-approve if past timeout."""
+    from datetime import datetime, timezone
+    timeout_minutes = int(os.getenv("HUMAN_APPROVAL_TIMEOUT_MINUTES", "15"))
+
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now(tz=timezone.utc)
+        orch = getattr(app.state, "orchestrator", None)
+        db   = getattr(app.state, "mongo_db",    None)
+
+        if orch is None or db is None:
+            continue
+
+        try:
+            # Find pending alerts older than timeout
+            cutoff = now.isoformat()
+            cursor = db["alerts"].find(
+                {"approved": None},
+                {"alert_id": 1, "session_id": 1, "machine_id": 1, "created_at": 1},
+            )
+            async for doc in cursor:
+                created_str = doc.get("created_at", "")
+                try:
+                    created = datetime.fromisoformat(str(created_str).replace("Z", "+00:00"))
+                    if created.tzinfo is None:
+                        from datetime import timezone as _tz
+                        created = created.replace(tzinfo=_tz.utc)
+                except Exception:
+                    continue
+
+                age_minutes = (now - created).total_seconds() / 60
+                if age_minutes >= timeout_minutes:
+                    thread_id = f"{doc['machine_id']}:{doc['session_id']}"
+                    logger.warning(
+                        "Timeout: alert {} pending {:.0f} min — auto-approving as CRITICAL",
+                        doc["alert_id"][:8], age_minutes,
+                    )
+                    try:
+                        await orch.resume(
+                            thread_id,
+                            approved=True,
+                            approved_by="timeout_auto",
+                            auto=True,
+                        )
+                    except Exception as exc:
+                        logger.warning("Timeout auto-approve failed: {}", exc)
+                        # Fallback: update MongoDB directly
+                        from datetime import timezone as _tz
+                        await db["alerts"].update_one(
+                            {"alert_id": doc["alert_id"]},
+                            {"$set": {
+                                "approved":      True,
+                                "approved_by":   "timeout_auto",
+                                "auto_approved": True,
+                                "approved_at":   now.isoformat(),
+                            }},
+                        )
+        except Exception as exc:
+            logger.warning("Timeout checker error: {}", exc)
+
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
@@ -37,7 +107,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ── ML Service ─────────────────────────────────────────────────────────────
     from app.services.ml_service import MLService
     ml_service = MLService()
-    ml_service.load()   # synchronous — loads models once
+    ml_service.load()
     app.state.ml = ml_service
 
     # ── Redis Service ──────────────────────────────────────────────────────────
@@ -56,7 +126,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             mongo_client = motor.AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=3000)
             db_name = os.getenv("MONGODB_DB_NAME", "defectsense")
             mongo_db = mongo_client[db_name]
-            # Verify connection
             await mongo_client.admin.command("ping")
             logger.info("MongoDB: connected to '{}'", db_name)
         except Exception as exc:
@@ -122,15 +191,45 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         amem=amem_service,
         letta=letta_service,
         groq_api_key=os.getenv("GROQ_API_KEY"),
-        reasoning_model=os.getenv("GROQ_MODEL_REASONING", "deepseek-r1-distill-llama-70b"),
+        reasoning_model=os.getenv("GROQ_MODEL_REASONING", "llama-3.3-70b-versatile"),
         fast_model=os.getenv("GROQ_MODEL_FAST", "llama-3.1-8b-instant"),
     )
     app.state.reasoner = reasoner
     logger.info("RootCauseReasonerAgent: ready")
 
+    # ── Alert Generator Agent ──────────────────────────────────────────────────
+    from app.agents.alert_generator import AlertGeneratorAgent
+    alert_generator = AlertGeneratorAgent(
+        mongo_db=mongo_db,
+        redis_service=redis_service,
+        groq_api_key=os.getenv("GROQ_API_KEY"),
+        fast_model=os.getenv("GROQ_MODEL_FAST", "llama-3.1-8b-instant"),
+    )
+    app.state.alert_generator = alert_generator
+    logger.info("AlertGeneratorAgent: ready")
+
+    # ── Orchestrator ───────────────────────────────────────────────────────────
+    from app.agents.orchestrator import DefectSenseOrchestrator
+    orchestrator = DefectSenseOrchestrator(
+        detector=detector,
+        context_retriever=context_retriever,
+        amem=amem_service,
+        reasoner=reasoner,
+        alert_generator=alert_generator,
+        groq_api_key=os.getenv("GROQ_API_KEY"),
+        auto_approve_threshold=float(os.getenv("AUTO_APPROVE_CONFIDENCE_THRESHOLD", "0.95")),
+        approval_timeout_minutes=int(os.getenv("HUMAN_APPROVAL_TIMEOUT_MINUTES", "15")),
+    )
+    orchestrator.build()
+    app.state.orchestrator = orchestrator
+    logger.info("Orchestrator: LangGraph pipeline ready")
+
     # ── WebSocket Connection Manager ───────────────────────────────────────────
     from app.api.routes.sensors import ConnectionManager
     app.state.ws_manager = ConnectionManager()
+
+    # ── Background: approval timeout checker ───────────────────────────────────
+    timeout_task = asyncio.create_task(_approval_timeout_loop(app))
 
     logger.info("DefectSense: all services ready — listening for sensor data")
     logger.info("=" * 60)
@@ -138,6 +237,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield  # ← application runs here
 
     # ── Shutdown ───────────────────────────────────────────────────────────────
+    timeout_task.cancel()
     logger.info("DefectSense: shutting down")
     await redis_service.close()
     logger.info("DefectSense: goodbye")
@@ -162,22 +262,27 @@ def create_app() -> FastAPI:
 
     # ── Routers ────────────────────────────────────────────────────────────────
     from app.api.routes.sensors import router as sensors_router
-    app.include_router(sensors_router, prefix="/api/sensors", tags=["sensors"])
+    from app.api.routes.alerts  import router as alerts_router
+    from app.api.websocket      import router as ws_router
 
-    # WebSocket endpoint: ws://localhost:8080/api/sensors/stream
+    app.include_router(sensors_router, prefix="/api/sensors", tags=["sensors"])
+    app.include_router(alerts_router,  prefix="/api/alerts",  tags=["alerts"])
+    app.include_router(ws_router,      prefix="/ws",          tags=["websocket"])
 
     @app.get("/health", tags=["health"])
     async def health() -> dict:
         return {
-            "status":           "ok",
-            "ml_ready":         app.state.ml.is_ready,
-            "redis_connected":  app.state.redis.is_connected,
-            "mongo_connected":  app.state.mongo_db is not None,
-            "qdrant_connected": app.state.qdrant is not None,
-            "rag_ready":        app.state.context_retriever is not None,
-            "amem_ready":       app.state.amem is not None,
-            "letta_ready":      app.state.letta.is_ready,
-            "reasoner_ready":   True,
+            "status":              "ok",
+            "ml_ready":            app.state.ml.is_ready,
+            "redis_connected":     app.state.redis.is_connected,
+            "mongo_connected":     app.state.mongo_db is not None,
+            "qdrant_connected":    app.state.qdrant is not None,
+            "rag_ready":           app.state.context_retriever is not None,
+            "amem_ready":          app.state.amem is not None,
+            "letta_ready":         app.state.letta.is_ready,
+            "reasoner_ready":      True,
+            "alert_generator_ready": True,
+            "orchestrator_ready":  app.state.orchestrator is not None,
         }
 
     return app
