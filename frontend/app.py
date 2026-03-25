@@ -188,21 +188,34 @@ def get_pending_ids() -> list[str]:
     return [a["alert_id"] for a in data.get("alerts", [])]
 
 
-def approve_alert(alert_id: str) -> str:
+def approve_alert(alert_id: str):
     if not alert_id:
-        return "Select an alert first."
+        return "Select an alert first.", gr.Dropdown(choices=get_pending_ids())
     resp = _post(f"/api/alerts/{alert_id}/approve", {"approved_by": "dashboard_user"})
-    return f"Approved: {alert_id[:8]}…" if "error" not in resp else f"Error: {resp['error']}"
+    if "error" in resp:
+        err = resp["error"]
+        if "409" in err:
+            msg = f"Already decided — click Reload to refresh the list."
+        else:
+            msg = f"Error: {err}"
+    else:
+        msg = f"Approved: {alert_id[:8]}…"
+    return msg, gr.Dropdown(choices=get_pending_ids())
 
 
-def reject_alert(alert_id: str, reason: str) -> str:
+def reject_alert(alert_id: str, reason: str):
     if not alert_id:
-        return "Select an alert first."
+        return "Select an alert first.", gr.Dropdown(choices=get_pending_ids())
     if not reason.strip():
-        return "Enter a rejection reason."
+        return "Enter a rejection reason.", gr.Dropdown(choices=get_pending_ids())
     resp = _post(f"/api/alerts/{alert_id}/reject",
                  {"rejection_reason": reason, "rejected_by": "dashboard_user"})
-    return f"Rejected: {alert_id[:8]}…" if "error" not in resp else f"Error: {resp['error']}"
+    if "error" in resp:
+        err = resp["error"]
+        msg = "Already decided — click Reload." if "409" in err else f"Error: {err}"
+    else:
+        msg = f"Rejected: {alert_id[:8]}…"
+    return msg, gr.Dropdown(choices=get_pending_ids())
 
 
 # ── Tab 3: Root Cause Analysis ─────────────────────────────────────────────────
@@ -340,9 +353,9 @@ def build_app() -> gr.Blocks:
                     reject_btn   = gr.Button("Reject",  variant="stop",   scale=1)
 
                 action_out = gr.Textbox(label="Result", interactive=False)
-                approve_btn.click(fn=approve_alert, inputs=pending_dd, outputs=action_out)
-                reject_btn.click( fn=reject_alert,  inputs=[pending_dd, reject_text], outputs=action_out)
-                reload_pend.click(fn=lambda: gr.Dropdown(choices=get_pending_ids()), outputs=pending_dd)
+                approve_btn.click(fn=approve_alert, inputs=pending_dd,                    outputs=[action_out, pending_dd])
+                reject_btn.click( fn=reject_alert,  inputs=[pending_dd, reject_text],     outputs=[action_out, pending_dd])
+                reload_pend.click(fn=lambda: gr.Dropdown(choices=get_pending_ids()),       outputs=pending_dd)
 
             # ── Tab 3 ──────────────────────────────────────────────────────────
             with gr.TabItem("Root Cause Analysis"):
