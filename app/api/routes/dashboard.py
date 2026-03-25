@@ -53,9 +53,13 @@ async def dashboard_stats(request: Request):
     # ── Machine count from Redis keys ──────────────────────────────────────────
     if redis and redis.is_connected:
         try:
-            keys = await redis._client.keys("sensor:*:history")
-            machine_ids = {k.decode().split(":")[1] for k in keys if isinstance(k, bytes)}
-            machine_ids |= {k.split(":")[1] for k in keys if isinstance(k, str)}
+            keys = await redis._client.keys("sensor:*:readings")
+            machine_ids = set()
+            for k in keys:
+                raw = k.decode() if isinstance(k, bytes) else k
+                parts = raw.split(":")
+                if len(parts) >= 2:
+                    machine_ids.add(parts[1])
             stats["total_machines_monitored"] = len(machine_ids)
         except Exception as exc:
             logger.warning("Dashboard stats: Redis keys error — {}", exc)
@@ -137,7 +141,7 @@ async def dashboard_machines(request: Request, limit: int = 50):
     # Discover machines from Redis history keys
     if redis and redis.is_connected:
         try:
-            keys = await redis._client.keys("sensor:*:history")
+            keys = await redis._client.keys("sensor:*:readings")
             for k in keys:
                 raw = k.decode() if isinstance(k, bytes) else k
                 parts = raw.split(":")
