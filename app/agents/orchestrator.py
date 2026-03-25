@@ -285,7 +285,7 @@ class DefectSenseOrchestrator:
     async def _node_detect_anomaly(self, state: PipelineState) -> PipelineState:
         reading = state["reading"]
         try:
-            result: AnomalyResult = await self._detector.detect(reading)
+            result: AnomalyResult = await self._detector.run(reading)
             logger.debug(
                 "Orchestrator[detect]: machine={} anomaly={} prob={:.3f}",
                 reading.machine_id, result.is_anomaly, result.failure_probability,

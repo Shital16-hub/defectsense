@@ -32,18 +32,43 @@ async def ingest_sensor(reading: SensorReading, request: Request) -> AnomalyResu
     - Cached in Redis
     - Broadcast to all connected WebSocket clients
     """
-    detector = request.app.state.detector
+    detector   = request.app.state.detector
+    orchestrator = getattr(request.app.state, "orchestrator", None)
     ws_manager: ConnectionManager = request.app.state.ws_manager
 
     result: AnomalyResult = await detector.run(reading)
 
-    # Broadcast to WebSocket clients (non-blocking)
     if result.is_anomaly:
+        # Broadcast raw anomaly to WebSocket clients
         asyncio.create_task(
             ws_manager.broadcast(result.model_dump(mode="json"))
         )
+        # Kick off full pipeline: root cause → alert (non-blocking)
+        if orchestrator is not None:
+            asyncio.create_task(_run_pipeline(orchestrator, reading))
 
     return result
+
+
+async def _run_pipeline(orchestrator, reading: SensorReading) -> None:
+    """Background task: run full orchestrator pipeline for an anomaly."""
+    try:
+        state = await orchestrator.run(reading)
+        alert = state.get("alert")
+        if alert:
+            logger.info(
+                "Pipeline complete: alert {} | machine={} approved={}",
+                alert.alert_id[:8], alert.machine_id, alert.approved,
+            )
+        else:
+            logger.info(
+                "Pipeline complete: no alert generated for machine={} (anomaly={} approved={})",
+                reading.machine_id,
+                state.get("is_anomaly"),
+                state.get("approved"),
+            )
+    except Exception as exc:
+        logger.error("Pipeline error for machine={}: {}", reading.machine_id, exc)
 
 
 # ── GET /api/sensors/{machine_id}/history ─────────────────────────────────────
