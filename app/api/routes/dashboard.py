@@ -83,21 +83,26 @@ async def dashboard_stats(request: Request):
 
     # ── Avg resolution time (approved alerts only) ─────────────────────────────
     try:
-        pipeline = [
-            {"$match": {"approved": True, "approved_at": {"$exists": True}}},
-            {"$project": {
-                "diff_ms": {
-                    "$subtract": [
-                        {"$dateFromString": {"dateString": "$approved_at"}},
-                        {"$dateFromString": {"dateString": "$created_at"}},
-                    ]
-                }
-            }},
-            {"$group": {"_id": None, "avg_ms": {"$avg": "$diff_ms"}}},
-        ]
-        rows = await db["alerts"].aggregate(pipeline).to_list(1)
-        if rows:
-            stats["avg_resolution_time_minutes"] = round(rows[0]["avg_ms"] / 60_000, 1)
+        resolved = await db["alerts"].find(
+            {"approved": True, "approved_at": {"$exists": True}, "created_at": {"$exists": True}},
+            {"created_at": 1, "approved_at": 1},
+        ).to_list(200)
+        if resolved:
+            from datetime import datetime as _dt
+            deltas = []
+            for doc in resolved:
+                try:
+                    def _parse(v):
+                        if isinstance(v, _dt):
+                            return v
+                        return _dt.fromisoformat(str(v).replace("Z", "+00:00"))
+                    delta = (_parse(doc["approved_at"]) - _parse(doc["created_at"])).total_seconds()
+                    if delta > 0:
+                        deltas.append(delta)
+                except Exception:
+                    pass
+            if deltas:
+                stats["avg_resolution_time_minutes"] = round(sum(deltas) / len(deltas) / 60, 1)
     except Exception:
         pass
 
