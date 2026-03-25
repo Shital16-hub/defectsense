@@ -261,13 +261,15 @@ def create_app() -> FastAPI:
     )
 
     # ── Routers ────────────────────────────────────────────────────────────────
-    from app.api.routes.sensors import router as sensors_router
-    from app.api.routes.alerts  import router as alerts_router
-    from app.api.websocket      import router as ws_router
+    from app.api.routes.sensors   import router as sensors_router
+    from app.api.routes.alerts    import router as alerts_router
+    from app.api.routes.dashboard import router as dashboard_router
+    from app.api.websocket        import router as ws_router
 
-    app.include_router(sensors_router, prefix="/api/sensors", tags=["sensors"])
-    app.include_router(alerts_router,  prefix="/api/alerts",  tags=["alerts"])
-    app.include_router(ws_router,      prefix="/ws",          tags=["websocket"])
+    app.include_router(sensors_router,   prefix="/api/sensors",   tags=["sensors"])
+    app.include_router(alerts_router,    prefix="/api/alerts",    tags=["alerts"])
+    app.include_router(dashboard_router, prefix="/api/dashboard", tags=["dashboard"])
+    app.include_router(ws_router,        prefix="/ws",            tags=["websocket"])
 
     @app.get("/health", tags=["health"])
     async def health() -> dict:
