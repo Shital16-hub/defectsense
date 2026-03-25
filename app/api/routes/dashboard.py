@@ -88,14 +88,16 @@ async def dashboard_stats(request: Request):
             {"created_at": 1, "approved_at": 1},
         ).to_list(200)
         if resolved:
-            from datetime import datetime as _dt
+            from datetime import datetime as _dt, timezone as _tz
             deltas = []
             for doc in resolved:
                 try:
                     def _parse(v):
                         if isinstance(v, _dt):
-                            return v
-                        return _dt.fromisoformat(str(v).replace("Z", "+00:00"))
+                            dt = v
+                        else:
+                            dt = _dt.fromisoformat(str(v).replace("Z", "+00:00"))
+                        return dt if dt.tzinfo else dt.replace(tzinfo=_tz.utc)
                     delta = (_parse(doc["approved_at"]) - _parse(doc["created_at"])).total_seconds()
                     if delta > 0:
                         deltas.append(delta)
