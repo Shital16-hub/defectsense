@@ -134,20 +134,59 @@ class RAGEvaluationService:
         samples = []
         for alert in alerts:
             try:
-                rcr         = alert.get("root_cause_report") or {}
-                machine_id  = alert.get("machine_id", "UNKNOWN")
-                anom        = rcr.get("anomaly_result") or {}
-                failure_type = anom.get("failure_type_prediction") or "UNKNOWN"
+                rcr           = alert.get("root_cause_report") or {}
+                machine_id    = alert.get("machine_id", "UNKNOWN")
+                anom          = rcr.get("anomaly_result") or {}
+                failure_type  = anom.get("failure_type_prediction") or "UNKNOWN"
                 sensor_deltas = anom.get("sensor_deltas") or {}
-                symptoms_parts = []
-                for k, v in sensor_deltas.items():
-                    if v is not None:
-                        symptoms_parts.append(f"{k.replace('_', ' ')}={v:.2f}")
-                symptoms_str = ", ".join(symptoms_parts) or "anomalous sensor readings"
+
+                # Build human-readable question matching the RAG corpus vocabulary
+                symptom_parts: list[str] = []
+                HIGH_Z = 2.0
+                MED_Z  = 1.0
+
+                pt = sensor_deltas.get("process_temperature", 0.0) or 0.0
+                at = sensor_deltas.get("air_temperature",     0.0) or 0.0
+                rs = sensor_deltas.get("rotational_speed",    0.0) or 0.0
+                tq = sensor_deltas.get("torque",              0.0) or 0.0
+                tw = sensor_deltas.get("tool_wear",           0.0) or 0.0
+
+                if abs(pt) >= HIGH_Z:
+                    symptom_parts.append("process temperature significantly " + ("elevated" if pt > 0 else "below normal"))
+                elif abs(pt) >= MED_Z:
+                    symptom_parts.append("process temperature " + ("elevated" if pt > 0 else "below normal"))
+
+                if abs(at) >= HIGH_Z:
+                    symptom_parts.append("air temperature significantly " + ("elevated" if at > 0 else "below normal"))
+
+                if abs(rs) >= HIGH_Z:
+                    symptom_parts.append("rotational speed dropped significantly" if rs < 0 else "rotational speed elevated")
+                elif abs(rs) >= MED_Z:
+                    symptom_parts.append("rotational speed reduced" if rs < 0 else "rotational speed increased")
+
+                if abs(tq) >= HIGH_Z:
+                    symptom_parts.append("torque high — possible mechanical overload" if tq > 0 else "torque low")
+                elif abs(tq) >= MED_Z:
+                    symptom_parts.append("torque above normal" if tq > 0 else "torque below normal")
+
+                if abs(tw) >= MED_Z:
+                    symptom_parts.append("tool wear elevated")
+
+                failure_context = {
+                    "HDF": "thermal alarm conditions, possible cooling system issue",
+                    "TWF": "tool wear exceeded normal tolerance",
+                    "PWF": "power consumption outside normal operating range",
+                    "OSF": "mechanical overload, torque spike recorded",
+                    "RNF": "unexpected fault, no single dominant cause",
+                }
+                if failure_type in failure_context:
+                    symptom_parts.append(failure_context[failure_type])
+
+                symptoms_text = "; ".join(symptom_parts) if symptom_parts else "multiple sensor deviations detected"
 
                 question = (
                     f"What is the root cause of the anomaly on machine {machine_id} "
-                    f"showing {failure_type} failure with symptoms: {symptoms_str}?"
+                    f"showing {failure_type} failure with symptoms: {symptoms_text}?"
                 )
                 answer   = rcr.get("root_cause") or "Unknown root cause"
 
