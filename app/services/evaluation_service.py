@@ -91,6 +91,9 @@ class RAGEvaluationService:
                     "answer_relevancy":  ar,
                 })
 
+                # Respect Groq rate limits: max 30 samples/min (3 calls per sample)
+                await asyncio.sleep(2.0)
+
             avg_cp   = sum(cp_scores)    / len(cp_scores)
             avg_faith = sum(faith_scores) / len(faith_scores)
             avg_ar   = sum(ar_scores)    / len(ar_scores)
@@ -258,7 +261,11 @@ class RAGEvaluationService:
         return await self._llm_score(prompt)
 
     async def _llm_score(self, prompt: str) -> float:
-        """Run a sync Groq call in an executor and parse the JSON score."""
+        """Run a sync Groq call in an executor and parse the JSON score.
+        Retries up to 3 times with backoff on rate-limit errors.
+        """
+        import time
+
         try:
             from langchain_groq import ChatGroq
             from langchain_core.messages import HumanMessage
@@ -270,12 +277,29 @@ class RAGEvaluationService:
                 max_tokens=128,
             )
 
-            def _call():
-                resp = llm.invoke([HumanMessage(content=prompt)])
-                return resp.content
+            def _call_with_retry():
+                for attempt in range(3):
+                    try:
+                        resp = llm.invoke([HumanMessage(content=prompt)])
+                        return resp.content
+                    except Exception as exc:
+                        if "rate" in str(exc).lower() or "429" in str(exc):
+                            wait = (attempt + 1) * 10  # 10s, 20s, 30s
+                            logger.warning(
+                                "Groq rate limit hit, waiting {}s (attempt {}/3)",
+                                wait, attempt + 1,
+                            )
+                            time.sleep(wait)
+                        else:
+                            raise
+                return None  # all retries exhausted
 
             loop    = asyncio.get_event_loop()
-            content = await loop.run_in_executor(None, _call)
+            content = await loop.run_in_executor(None, _call_with_retry)
+
+            if content is None:
+                logger.warning("RAGEvaluationService._llm_score: all retries exhausted")
+                return 0.5
 
             # Extract JSON — may have markdown fences
             raw = content.strip()
@@ -288,7 +312,7 @@ class RAGEvaluationService:
             return max(0.0, min(1.0, score))
 
         except Exception as exc:
-            logger.debug("RAGEvaluationService._llm_score failed — {}", exc)
+            logger.warning("Evaluation scoring failed (possible rate limit) — {}", exc)
             return 0.5
 
     # ── Persistence ────────────────────────────────────────────────────────────
@@ -366,6 +390,9 @@ class LLMJudgeEvaluationService:
                 except Exception as exc:
                     logger.debug("LLMJudgeEvaluationService: skipping alert — {}", exc)
 
+                # Respect Groq rate limits: 5 LLM calls per report
+                await asyncio.sleep(3.0)
+
             n = max(len(sample_rows), 1)
             avg: dict[str, float] = {k: round(v / n, 4) for k, v in dimension_sums.items()}
             avg["overall"] = round(sum(avg.values()) / len(avg), 4)
@@ -442,6 +469,8 @@ class LLMJudgeEvaluationService:
             "confidence_calibration": 0.5,
         }
 
+        import time
+
         try:
             from langchain_groq import ChatGroq
             from langchain_core.messages import HumanMessage
@@ -453,12 +482,34 @@ class LLMJudgeEvaluationService:
                 max_tokens=512,
             )
 
-            def _call():
-                resp = llm.invoke([HumanMessage(content=prompt)])
-                return resp.content
+            def _call_with_retry():
+                for attempt in range(3):
+                    try:
+                        resp = llm.invoke([HumanMessage(content=prompt)])
+                        return resp.content
+                    except Exception as exc:
+                        if "rate" in str(exc).lower() or "429" in str(exc):
+                            wait = (attempt + 1) * 10  # 10s, 20s, 30s
+                            logger.warning(
+                                "Groq rate limit hit, waiting {}s (attempt {}/3)",
+                                wait, attempt + 1,
+                            )
+                            time.sleep(wait)
+                        else:
+                            raise
+                return None  # all retries exhausted
 
             loop    = asyncio.get_event_loop()
-            content = await loop.run_in_executor(None, _call)
+            content = await loop.run_in_executor(None, _call_with_retry)
+
+            if content is None:
+                logger.warning("LLMJudgeEvaluationService._score_report: all retries exhausted")
+                return {
+                    "alert_id":  alert_doc.get("alert_id", ""),
+                    "machine_id": machine_id,
+                    **defaults,
+                    "justifications": {},
+                }
 
             raw = content.strip()
             if "```" in raw:
@@ -482,7 +533,7 @@ class LLMJudgeEvaluationService:
             return scores
 
         except Exception as exc:
-            logger.debug("LLMJudgeEvaluationService._score_report failed — {}", exc)
+            logger.warning("Evaluation scoring failed (possible rate limit) — {}", exc)
             return {
                 "alert_id":  alert_doc.get("alert_id", ""),
                 "machine_id": machine_id,
