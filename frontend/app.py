@@ -386,6 +386,106 @@ def load_health():
     return svc_md, stats_md, ml_md
 
 
+# ── Tab 6: Evaluation ──────────────────────────────────────────────────────────
+
+def _score_colour(score: float) -> str:
+    if score >= 0.7:
+        return "#22c55e"   # green
+    if score >= 0.4:
+        return "#f97316"   # orange
+    return "#ef4444"       # red
+
+
+def _score_card(label: str, score: float) -> str:
+    colour = _score_colour(score)
+    pct    = f"{score * 100:.1f}%"
+    return (
+        f'<div style="border:1px solid #334155;border-radius:8px;padding:10px;'
+        f'text-align:center;min-width:100px;">'
+        f'<div style="font-size:11px;color:#94a3b8;">{label}</div>'
+        f'<div style="font-size:22px;font-weight:bold;color:{colour};">{pct}</div>'
+        f"</div>"
+    )
+
+
+def run_evaluation_now() -> str:
+    resp = _get("/api/evaluation/run")
+    return resp.get("message", str(resp))
+
+
+def load_evaluation_results():
+    """Return (status_text, scores_html, history_rows, sample_rows)."""
+    latest  = _get("/api/evaluation/latest")
+    history = _get("/api/evaluation/history", {"limit": 20})
+
+    # ── Status text ──────────────────────────────────────────────────────────
+    rag_doc = latest.get("rag")   if isinstance(latest, dict) else None
+    llm_doc = latest.get("llm_judge") if isinstance(latest, dict) else None
+
+    if rag_doc:
+        run_at   = rag_doc.get("run_at", "")[:19].replace("T", " ")
+        status_t = f"Last evaluation: {run_at} UTC"
+    else:
+        status_t = "No evaluation results yet — click 'Run Evaluation Now'"
+
+    # ── Score cards HTML ─────────────────────────────────────────────────────
+    cards = []
+    if rag_doc:
+        s = rag_doc.get("scores", {})
+        cards.append("<b>RAG Pipeline</b>&nbsp;&nbsp;")
+        for label, key in [
+            ("Context Precision", "context_precision"),
+            ("Faithfulness",      "faithfulness"),
+            ("Answer Relevancy",  "answer_relevancy"),
+        ]:
+            cards.append(_score_card(label, s.get(key, 0.0)))
+        cards.append("&nbsp;&nbsp;<b>LLM Judge</b>&nbsp;&nbsp;")
+    if llm_doc:
+        s = llm_doc.get("scores", {})
+        for label, key in [
+            ("Root Cause",   "root_cause_correctness"),
+            ("Severity",     "severity_accuracy"),
+            ("Actions",      "action_quality"),
+            ("Reasoning",    "reasoning_quality"),
+            ("Calibration",  "confidence_calibration"),
+        ]:
+            cards.append(_score_card(label, s.get(key, 0.0)))
+    scores_html = (
+        '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">'
+        + "".join(cards)
+        + "</div>"
+    ) if cards else "<i>No scores yet.</i>"
+
+    # ── History table ─────────────────────────────────────────────────────────
+    history_rows = []
+    for r in (history.get("results", []) if isinstance(history, dict) else []):
+        s       = r.get("scores", {})
+        run_at  = r.get("run_at", "")[:19].replace("T", " ")
+        et      = r.get("eval_type", "")
+        cp      = f"{s.get('context_precision', 0)*100:.1f}%" if et == "rag" else "—"
+        fa      = f"{s.get('faithfulness',      0)*100:.1f}%" if et == "rag" else "—"
+        ar      = f"{s.get('answer_relevancy',  0)*100:.1f}%" if et == "rag" else "—"
+        overall = f"{s.get('overall', 0)*100:.1f}%"
+        history_rows.append([run_at, et, cp, fa, ar, overall])
+
+    # ── Sample scores from latest RAG eval ────────────────────────────────────
+    sample_rows = []
+    if rag_doc:
+        for s in rag_doc.get("sample_scores", []):
+            sample_rows.append([
+                s.get("machine_id", ""),
+                f"{s.get('context_precision', 0)*100:.1f}%",
+                f"{s.get('faithfulness',      0)*100:.1f}%",
+                f"{s.get('answer_relevancy',  0)*100:.1f}%",
+            ])
+
+    return status_t, scores_html, history_rows, sample_rows
+
+
+def refresh_evaluation():
+    return load_evaluation_results()
+
+
 # ── Build app ──────────────────────────────────────────────────────────────────
 
 def build_app() -> gr.Blocks:
@@ -563,8 +663,50 @@ def build_app() -> gr.Blocks:
                     outputs=t5_recent_tbl,
                 )
 
+            # ── Tab 6 ──────────────────────────────────────────────────────────
+            with gr.TabItem("Evaluation"):
+                gr.Markdown(
+                    "### LLM-as-Judge Evaluation\n"
+                    "Scores the RAG pipeline (context precision, faithfulness, answer relevancy) "
+                    "and root-cause reports (correctness, severity, actions, reasoning, calibration) "
+                    "using Groq llama-3.3-70b as judge. Runs nightly at 02:00 UTC."
+                )
+
+                with gr.Row():
+                    t6_run_btn     = gr.Button("Run Evaluation Now", variant="primary", scale=1)
+                    t6_refresh_btn = gr.Button("Refresh Results",    variant="secondary", scale=1)
+                    t6_status      = gr.Textbox(label="Status", interactive=False, scale=3)
+
+                t6_scores_html = gr.HTML(value="<i>Loading…</i>")
+
+                gr.Markdown("#### Evaluation History")
+                t6_history_tbl = gr.Dataframe(
+                    headers=["Run Time", "Type", "Context Precision", "Faithfulness", "Answer Relevancy", "Overall"],
+                    interactive=False,
+                    wrap=True,
+                    label="History (last 20)",
+                )
+
+                gr.Markdown("#### Sample Scores — Latest RAG Evaluation")
+                t6_sample_tbl = gr.Dataframe(
+                    headers=["Machine ID", "Context Precision", "Faithfulness", "Answer Relevancy"],
+                    interactive=False,
+                    wrap=True,
+                    label="Per-Alert RAG Scores",
+                )
+
+                _t6_outputs = [t6_status, t6_scores_html, t6_history_tbl, t6_sample_tbl]
+
+                def _run_and_refresh():
+                    msg = run_evaluation_now()
+                    return (msg,) + tuple(load_evaluation_results()[1:])
+
+                t6_run_btn.click(fn=_run_and_refresh,     outputs=_t6_outputs)
+                t6_refresh_btn.click(fn=refresh_evaluation, outputs=_t6_outputs)
+
         demo.load(fn=load_health, outputs=[svc_md, stats_md, ml_md])
         demo.load(fn=refresh_recent_logs, outputs=t5_recent_tbl)
+        demo.load(fn=refresh_evaluation,  outputs=[t6_status, t6_scores_html, t6_history_tbl, t6_sample_tbl])
 
     return demo
 

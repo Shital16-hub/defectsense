@@ -237,6 +237,38 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from app.api.routes.sensors import ConnectionManager
     app.state.ws_manager = ConnectionManager()
 
+    # ── Evaluation Services ────────────────────────────────────────────────────
+    from app.services.evaluation_service import (
+        RAGEvaluationService, LLMJudgeEvaluationService, run_nightly_evaluation,
+    )
+    rag_eval_service = RAGEvaluationService(
+        mongo_db=mongo_db,
+        qdrant_service=qdrant_service,
+        groq_api_key=os.getenv("GROQ_API_KEY", ""),
+    )
+    llm_judge_service = LLMJudgeEvaluationService(
+        mongo_db=mongo_db,
+        groq_api_key=os.getenv("GROQ_API_KEY", ""),
+    )
+    app.state.rag_eval_service  = rag_eval_service
+    app.state.llm_judge_service = llm_judge_service
+    logger.info("Evaluation services: RAG + LLM-Judge ready")
+
+    # ── Evaluation Scheduler ───────────────────────────────────────────────────
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(
+        run_nightly_evaluation,
+        "cron",
+        hour=2,
+        minute=0,
+        args=[app],
+        id="nightly_evaluation",
+        replace_existing=True,
+    )
+    scheduler.start()
+    logger.info("Evaluation scheduler: nightly job scheduled at 02:00 UTC")
+
     # ── Background: approval timeout checker ───────────────────────────────────
     timeout_task = asyncio.create_task(_approval_timeout_loop(app))
 
@@ -247,6 +279,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ── Shutdown ───────────────────────────────────────────────────────────────
     timeout_task.cancel()
+    scheduler.shutdown()
     logger.info("DefectSense: shutting down")
     await redis_service.close()
     logger.info("DefectSense: goodbye")
@@ -274,12 +307,14 @@ def create_app() -> FastAPI:
     from app.api.routes.alerts            import router as alerts_router
     from app.api.routes.dashboard         import router as dashboard_router
     from app.api.routes.maintenance_logs  import router as maintenance_logs_router
+    from app.api.routes.evaluation        import router as evaluation_router
     from app.api.websocket                import router as ws_router
 
     app.include_router(sensors_router,          prefix="/api/sensors",           tags=["sensors"])
     app.include_router(alerts_router,           prefix="/api/alerts",            tags=["alerts"])
     app.include_router(dashboard_router,        prefix="/api/dashboard",         tags=["dashboard"])
     app.include_router(maintenance_logs_router, prefix="/api/maintenance-logs",  tags=["maintenance-logs"])
+    app.include_router(evaluation_router,       prefix="/api/evaluation",        tags=["evaluation"])
     app.include_router(ws_router,               prefix="/ws",                    tags=["websocket"])
 
     @app.get("/health", tags=["health"])
