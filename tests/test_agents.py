@@ -217,3 +217,96 @@ class TestOrchestratorHITL:
         state = await orch.run(normal_reading)
         assert state.get("is_anomaly") is False
         assert state.get("alert") is None
+
+
+# ── post_resolution_indexer ────────────────────────────────────────────────────
+
+class TestPostResolutionIndexer:
+
+    def _make_orch(self) -> "DefectSenseOrchestrator":
+        from app.agents.orchestrator import DefectSenseOrchestrator
+        return DefectSenseOrchestrator(app_base_url="http://testserver")
+
+    @pytest.mark.asyncio
+    async def test_post_resolution_indexer_runs_on_approval(
+        self, sample_anomaly_result, sample_root_cause_report
+    ):
+        """When approved=True, the node should POST the maintenance log and set auto_indexed=True."""
+        orch = self._make_orch()
+        state = {
+            "approved":          True,
+            "approved_by":       "test_engineer",
+            "machine_id":        "TEST_M001",
+            "anomaly_result":    sample_anomaly_result,
+            "root_cause_report": sample_root_cause_report,
+        }
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock(return_value=None)
+        mock_response.json = MagicMock(return_value={"log_id": "abc-123"})
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__  = AsyncMock(return_value=None)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await orch._node_post_resolution_indexer(state)
+
+        assert result["auto_indexed"] is True
+        mock_client.post.assert_awaited_once()
+
+        # Verify the call was made to the maintenance-logs endpoint
+        call_url = mock_client.post.call_args[0][0]
+        assert "/api/maintenance-logs/add" in call_url
+
+        # Verify the payload contains expected fields
+        call_json = mock_client.post.call_args[1]["json"]
+        assert call_json["machine_id"]   == "TEST_M001"
+        assert call_json["failure_type"] == "HDF"
+        assert call_json["technician"]   == "test_engineer"
+
+    @pytest.mark.asyncio
+    async def test_post_resolution_indexer_skips_on_rejection(
+        self, sample_anomaly_result, sample_root_cause_report
+    ):
+        """When approved=False, the node should NOT call the API and return auto_indexed=False."""
+        orch = self._make_orch()
+        state = {
+            "approved":          False,
+            "approved_by":       "test_engineer",
+            "machine_id":        "TEST_M001",
+            "anomaly_result":    sample_anomaly_result,
+            "root_cause_report": sample_root_cause_report,
+        }
+
+        with patch("httpx.AsyncClient") as mock_cls:
+            result = await orch._node_post_resolution_indexer(state)
+
+        assert result["auto_indexed"] is False
+        mock_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_post_resolution_indexer_does_not_fail_pipeline_on_error(
+        self, sample_anomaly_result, sample_root_cause_report
+    ):
+        """When httpx raises, the node should return auto_indexed=False without re-raising."""
+        orch = self._make_orch()
+        state = {
+            "approved":          True,
+            "approved_by":       "test_engineer",
+            "machine_id":        "TEST_M001",
+            "anomaly_result":    sample_anomaly_result,
+            "root_cause_report": sample_root_cause_report,
+        }
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=Exception("Connection refused"))
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__  = AsyncMock(return_value=None)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await orch._node_post_resolution_indexer(state)
+
+        # Must NOT raise — pipeline resilience is the key requirement
+        assert result["auto_indexed"] is False

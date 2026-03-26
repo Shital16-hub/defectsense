@@ -143,8 +143,16 @@ async def approve_alert(alert_id: str, body: ApproveRequest, request: Request):
         }},
     )
 
-    # Resume orchestrator thread if available
+    # Resume orchestrator thread if available.
+    # thread_id is not stored on the alert model; reconstruct it from machine_id + session_id,
+    # which is how the orchestrator originally built it: f"{machine_id}:{session_id}".
     thread_id = doc.get("thread_id")
+    if not thread_id:
+        _mid = doc.get("machine_id")
+        _sid = doc.get("session_id")
+        if _mid and _sid:
+            thread_id = f"{_mid}:{_sid}"
+
     if thread_id:
         try:
             orch = getattr(request.app.state, "orchestrator", None)
@@ -184,8 +192,15 @@ async def reject_alert(alert_id: str, body: RejectRequest, request: Request):
         }},
     )
 
-    # Resume orchestrator with rejection
+    # Resume orchestrator with rejection.
+    # thread_id is not stored on the alert model; reconstruct from machine_id + session_id.
     thread_id = doc.get("thread_id")
+    if not thread_id:
+        _mid = doc.get("machine_id")
+        _sid = doc.get("session_id")
+        if _mid and _sid:
+            thread_id = f"{_mid}:{_sid}"
+
     if thread_id:
         try:
             orch = getattr(request.app.state, "orchestrator", None)

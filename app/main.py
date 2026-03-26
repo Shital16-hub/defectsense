@@ -139,13 +139,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from app.services.qdrant_service import QdrantService
     qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
     qdrant_key = os.getenv("QDRANT_API_KEY") or None
-    qdrant_service = QdrantService(url=qdrant_url, api_key=qdrant_key)
-    try:
-        await qdrant_service.init()
-        logger.info("Qdrant: connected and embedding model loaded")
-    except Exception as exc:
-        logger.warning("Qdrant unavailable — RAG context disabled: {}", exc)
-        qdrant_service = None
+    qdrant_service = None
+    for _attempt in range(3):
+        try:
+            _svc = QdrantService(url=qdrant_url, api_key=qdrant_key)
+            await _svc.init()
+            qdrant_service = _svc
+            logger.info("Qdrant: connected and embedding model loaded")
+            break
+        except Exception as exc:
+            if _attempt < 2:
+                logger.warning("Qdrant connect attempt {} failed — retrying in 3s: {}", _attempt + 1, exc)
+                await asyncio.sleep(3)
+            else:
+                logger.warning("Qdrant unavailable after 3 attempts — RAG context disabled: {}", exc)
     app.state.qdrant = qdrant_service
 
     # ── Anomaly Detector Agent ─────────────────────────────────────────────────
@@ -219,6 +226,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         groq_api_key=os.getenv("GROQ_API_KEY"),
         auto_approve_threshold=float(os.getenv("AUTO_APPROVE_CONFIDENCE_THRESHOLD", "0.95")),
         approval_timeout_minutes=int(os.getenv("HUMAN_APPROVAL_TIMEOUT_MINUTES", "15")),
+        app_base_url=os.getenv("APP_BASE_URL", "http://localhost:8080"),
     )
     orchestrator.build()
     app.state.orchestrator = orchestrator
@@ -261,15 +269,17 @@ def create_app() -> FastAPI:
     )
 
     # ── Routers ────────────────────────────────────────────────────────────────
-    from app.api.routes.sensors   import router as sensors_router
-    from app.api.routes.alerts    import router as alerts_router
-    from app.api.routes.dashboard import router as dashboard_router
-    from app.api.websocket        import router as ws_router
+    from app.api.routes.sensors           import router as sensors_router
+    from app.api.routes.alerts            import router as alerts_router
+    from app.api.routes.dashboard         import router as dashboard_router
+    from app.api.routes.maintenance_logs  import router as maintenance_logs_router
+    from app.api.websocket                import router as ws_router
 
-    app.include_router(sensors_router,   prefix="/api/sensors",   tags=["sensors"])
-    app.include_router(alerts_router,    prefix="/api/alerts",    tags=["alerts"])
-    app.include_router(dashboard_router, prefix="/api/dashboard", tags=["dashboard"])
-    app.include_router(ws_router,        prefix="/ws",            tags=["websocket"])
+    app.include_router(sensors_router,          prefix="/api/sensors",           tags=["sensors"])
+    app.include_router(alerts_router,           prefix="/api/alerts",            tags=["alerts"])
+    app.include_router(dashboard_router,        prefix="/api/dashboard",         tags=["dashboard"])
+    app.include_router(maintenance_logs_router, prefix="/api/maintenance-logs",  tags=["maintenance-logs"])
+    app.include_router(ws_router,               prefix="/ws",                    tags=["websocket"])
 
     @app.get("/health", tags=["health"])
     async def health() -> dict:

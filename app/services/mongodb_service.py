@@ -22,11 +22,13 @@ from loguru import logger
 
 from app.models.alert import MaintenanceAlert
 from app.models.anomaly import AnomalyResult
+from app.models.maintenance import MaintenanceLog
 
-COLL_READINGS  = "sensor_readings"
-COLL_ANOMALIES = "anomalies"
-COLL_ALERTS    = "alerts"
-COLL_SESSIONS  = "sessions"
+COLL_READINGS          = "sensor_readings"
+COLL_ANOMALIES         = "anomalies"
+COLL_ALERTS            = "alerts"
+COLL_SESSIONS          = "sessions"
+COLL_MAINTENANCE_LOGS  = "maintenance_logs"
 
 
 class MongoDBService:
@@ -238,3 +240,72 @@ class MongoDBService:
             )
         except Exception as exc:
             logger.warning("MongoDBService.save_session failed: {}", exc)
+
+    # ── Maintenance Logs ───────────────────────────────────────────────────────
+
+    async def save_maintenance_log(self, log: MaintenanceLog) -> Optional[str]:
+        """Persist a MaintenanceLog. Returns log_id or None on failure."""
+        if not self._db:
+            return None
+        try:
+            doc = log.model_dump(mode="json")
+            doc["saved_at"] = datetime.now(tz=timezone.utc).isoformat()
+            await self._db[COLL_MAINTENANCE_LOGS].insert_one(doc)
+            return log.log_id
+        except Exception as exc:
+            logger.warning("MongoDBService.save_maintenance_log failed: {}", exc)
+            return None
+
+    async def save_maintenance_logs(self, logs: list[MaintenanceLog]) -> int:
+        """Persist a batch of MaintenanceLogs. Returns count inserted."""
+        if not self._db or not logs:
+            return 0
+        try:
+            now = datetime.now(tz=timezone.utc).isoformat()
+            docs = [
+                {**log.model_dump(mode="json"), "saved_at": now}
+                for log in logs
+            ]
+            result = await self._db[COLL_MAINTENANCE_LOGS].insert_many(docs)
+            return len(result.inserted_ids)
+        except Exception as exc:
+            logger.warning("MongoDBService.save_maintenance_logs failed: {}", exc)
+            return 0
+
+    async def get_maintenance_logs(
+        self,
+        failure_type: Optional[str] = None,
+        machine_id: Optional[str] = None,
+        limit: int = 50,
+        skip: int = 0,
+    ) -> list[dict]:
+        """Return maintenance logs, optionally filtered by failure_type and/or machine_id."""
+        if not self._db:
+            return []
+        try:
+            query: dict = {}
+            if failure_type:
+                query["failure_type"] = failure_type
+            if machine_id:
+                query["machine_id"] = machine_id
+            cursor = (
+                self._db[COLL_MAINTENANCE_LOGS]
+                .find(query, {"_id": 0})
+                .sort("saved_at", -1)
+                .skip(skip)
+                .limit(limit)
+            )
+            return await cursor.to_list(length=limit)
+        except Exception as exc:
+            logger.warning("MongoDBService.get_maintenance_logs failed: {}", exc)
+            return []
+
+    async def count_maintenance_logs(self) -> int:
+        """Return total count of maintenance logs in MongoDB."""
+        if not self._db:
+            return 0
+        try:
+            return await self._db[COLL_MAINTENANCE_LOGS].count_documents({})
+        except Exception as exc:
+            logger.warning("MongoDBService.count_maintenance_logs failed: {}", exc)
+            return 0

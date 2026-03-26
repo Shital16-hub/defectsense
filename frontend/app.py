@@ -257,6 +257,100 @@ def load_root_cause(choice: str):
     return expl, summary, evidence, steps, memory
 
 
+# ── Tab 5: Log Maintenance Report ─────────────────────────────────────────────
+
+def submit_maintenance_log(
+    machine_id: str,
+    failure_type: str,
+    machine_type: str,
+    symptoms: str,
+    root_cause: str,
+    action_taken: str,
+    resolution_hours: float,
+    technician: str,
+    notes: str,
+):
+    """Validate and submit a maintenance log via the API."""
+    missing = []
+    if not machine_id.strip():
+        missing.append("Machine ID")
+    if not symptoms.strip():
+        missing.append("Symptoms")
+    if not root_cause.strip():
+        missing.append("Root Cause")
+    if not action_taken.strip():
+        missing.append("Action Taken")
+    if not technician.strip():
+        missing.append("Technician Name")
+
+    if missing:
+        msg = (
+            f'<span style="color:#ef4444;font-weight:bold;">'
+            f"Missing required fields: {', '.join(missing)}"
+            f"</span>"
+        )
+        return msg, *_get_recent_logs_table()
+
+    body = {
+        "machine_id":            machine_id.strip(),
+        "date":                  datetime.utcnow().isoformat(),
+        "failure_type":          failure_type,
+        "machine_type":          machine_type or None,
+        "symptoms":              symptoms.strip(),
+        "root_cause":            root_cause.strip(),
+        "action_taken":          action_taken.strip(),
+        "resolution_time_hours": float(resolution_hours or 0.0),
+        "technician":            technician.strip(),
+        "notes":                 notes.strip() or None,
+    }
+
+    resp = _post("/api/maintenance-logs/add", body)
+    if "error" in resp:
+        msg = (
+            f'<span style="color:#ef4444;font-weight:bold;">'
+            f"Submission failed: {resp['error']}"
+            f"</span>"
+        )
+    else:
+        log_id = resp.get("log_id", "unknown")
+        msg = (
+            f'<span style="color:#22c55e;font-weight:bold;">'
+            f"Report submitted successfully. Log ID: {log_id}"
+            f"</span>"
+        )
+
+    return msg, *_get_recent_logs_table()
+
+
+def _get_recent_logs_table(limit: int = 5) -> tuple:
+    """Fetch recent logs for the summary table. Returns (rows,) tuple."""
+    data = _get("/api/maintenance-logs", {"limit": limit})
+    logs = data.get("logs", []) if isinstance(data, dict) else []
+    rows = []
+    for lg in logs:
+        date_raw = str(lg.get("date", lg.get("saved_at", "")))
+        date_str = date_raw[:10] if date_raw else ""
+        rc = lg.get("root_cause", "")
+        rows.append([
+            lg.get("machine_id", ""),
+            lg.get("failure_type", ""),
+            rc[:50] + ("…" if len(rc) > 50 else ""),
+            lg.get("technician", ""),
+            date_str,
+        ])
+    return (rows,)
+
+
+def refresh_recent_logs():
+    (rows,) = _get_recent_logs_table()
+    return rows
+
+
+def clear_form():
+    """Return empty values for all form fields after successful submission."""
+    return "", "HDF", "M", "", "", "", 0.0, "", ""
+
+
 # ── Tab 4: System Health ───────────────────────────────────────────────────────
 
 def load_health():
@@ -394,7 +488,83 @@ def build_app() -> gr.Blocks:
                 t4 = gr.Timer(value=30)
                 t4.tick(fn=load_health, outputs=health_outputs)
 
+            # ── Tab 5 ──────────────────────────────────────────────────────────
+            with gr.TabItem("Log Maintenance Report"):
+                gr.Markdown(
+                    "### Submit a Maintenance Report\n"
+                    "Log a resolved incident to keep the RAG knowledge base up to date. "
+                    "Submitted reports are immediately searchable by the AI system."
+                )
+
+                with gr.Row():
+                    t5_machine_id  = gr.Textbox(label="Machine ID *", placeholder="e.g. M042", scale=2)
+                    t5_failure_type = gr.Dropdown(
+                        label="Failure Type *",
+                        choices=["TWF", "HDF", "PWF", "OSF", "RNF"],
+                        value="HDF", scale=1,
+                    )
+                    t5_machine_type = gr.Dropdown(
+                        label="Machine Type",
+                        choices=["L", "M", "H"],
+                        value="M", scale=1,
+                    )
+
+                t5_symptoms    = gr.Textbox(label="Symptoms *",    lines=3,
+                                            placeholder="Observable symptoms before/during failure")
+                t5_root_cause  = gr.Textbox(label="Root Cause *",  lines=3,
+                                            placeholder="Identified root cause of the failure")
+                t5_action_taken = gr.Textbox(label="Action Taken *", lines=3,
+                                             placeholder="Maintenance action performed to resolve the issue")
+
+                with gr.Row():
+                    t5_resolution_hours = gr.Number(
+                        label="Resolution Hours", value=0.0, minimum=0, maximum=720, scale=1,
+                    )
+                    t5_technician = gr.Textbox(label="Technician Name *",
+                                               placeholder="e.g. J. Smith", scale=2)
+
+                t5_notes = gr.Textbox(label="Notes (optional)", lines=2,
+                                      placeholder="Any additional observations or context")
+
+                t5_submit_btn = gr.Button("Submit Maintenance Report", variant="primary")
+
+                t5_status = gr.HTML(value="")
+
+                gr.Markdown("---\n### Recent Reports (last 5)")
+                t5_recent_tbl = gr.Dataframe(
+                    headers=["Machine ID", "Failure Type", "Root Cause", "Technician", "Date"],
+                    interactive=False,
+                    wrap=True,
+                    label="Recent Maintenance Logs",
+                )
+
+                # Form inputs list — used for both submit and clear
+                _t5_inputs = [
+                    t5_machine_id, t5_failure_type, t5_machine_type,
+                    t5_symptoms, t5_root_cause, t5_action_taken,
+                    t5_resolution_hours, t5_technician, t5_notes,
+                ]
+                _t5_outputs = [t5_status, t5_recent_tbl]
+
+                def _submit_and_maybe_clear(*args):
+                    status_html, rows = submit_maintenance_log(*args)
+                    # If submission succeeded (green), also clear the form
+                    if "22c55e" in status_html:
+                        return status_html, rows, "", "HDF", "M", "", "", "", 0.0, "", ""
+                    return status_html, rows, *args
+
+                t5_submit_btn.click(
+                    fn=submit_maintenance_log,
+                    inputs=_t5_inputs,
+                    outputs=_t5_outputs,
+                )
+                t5_submit_btn.click(
+                    fn=refresh_recent_logs,
+                    outputs=t5_recent_tbl,
+                )
+
         demo.load(fn=load_health, outputs=[svc_md, stats_md, ml_md])
+        demo.load(fn=refresh_recent_logs, outputs=t5_recent_tbl)
 
     return demo
 

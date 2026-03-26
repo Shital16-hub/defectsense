@@ -18,6 +18,11 @@ include = ["app*", "ml*"]
 line-length = 100
 target-version = "py311"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
