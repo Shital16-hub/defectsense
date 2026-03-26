@@ -223,22 +223,59 @@ class TestOrchestratorHITL:
 
 class TestPostResolutionIndexer:
 
-    def _make_orch(self) -> "DefectSenseOrchestrator":
+    def _make_orch(self, mongo_db=None) -> "DefectSenseOrchestrator":
         from app.agents.orchestrator import DefectSenseOrchestrator
-        return DefectSenseOrchestrator(app_base_url="http://testserver")
+        return DefectSenseOrchestrator(app_base_url="http://testserver", mongo_db=mongo_db)
+
+    def _make_mock_mongo(self, alert_doc: dict):
+        """Return a mock motor db whose alerts.find_one returns alert_doc."""
+        mock_mongo = MagicMock()
+        mock_mongo.__getitem__ = MagicMock(return_value=MagicMock(
+            find_one=AsyncMock(return_value=alert_doc)
+        ))
+        return mock_mongo
 
     @pytest.mark.asyncio
     async def test_post_resolution_indexer_runs_on_approval(
         self, sample_anomaly_result, sample_root_cause_report
     ):
-        """When approved=True, the node should POST the maintenance log and set auto_indexed=True."""
-        orch = self._make_orch()
+        """
+        When approved=True and MongoDB returns an alert doc, the node should POST
+        the maintenance log with correct machine_id / failure_type and set auto_indexed=True.
+
+        State intentionally omits anomaly_result and root_cause_report to simulate
+        what happens when LangGraph resume() only injects the approval fields.
+        """
+        alert_doc = {
+            "alert_id":   "test-alert-id",
+            "machine_id": "TEST_M001",
+            "session_id": "test-session-001",
+            "approved":   True,
+            "approved_by": "test_engineer",
+            "root_cause_report": {
+                "root_cause":          "Heat dissipation failure",
+                "confidence":          0.88,
+                "severity":            "HIGH",
+                "recommended_actions": ["Inspect cooling fan", "Schedule maintenance"],
+                "anomaly_result": {
+                    "machine_id":              "TEST_M001",
+                    "failure_type_prediction": "HDF",
+                    "sensor_deltas": {
+                        "process_temperature": 3.1,
+                        "rotational_speed":    -2.2,
+                    },
+                },
+            },
+        }
+        mock_mongo = self._make_mock_mongo(alert_doc)
+        orch = self._make_orch(mongo_db=mock_mongo)
+
+        # Simulate post-resume state: only approval fields present
         state = {
-            "approved":          True,
-            "approved_by":       "test_engineer",
-            "machine_id":        "TEST_M001",
-            "anomaly_result":    sample_anomaly_result,
-            "root_cause_report": sample_root_cause_report,
+            "approved":    True,
+            "approved_by": "test_engineer",
+            "session_id":  "test-session-001",
+            # machine_id, anomaly_result, root_cause_report deliberately absent
         }
 
         mock_response = MagicMock()
@@ -256,28 +293,22 @@ class TestPostResolutionIndexer:
         assert result["auto_indexed"] is True
         mock_client.post.assert_awaited_once()
 
-        # Verify the call was made to the maintenance-logs endpoint
-        call_url = mock_client.post.call_args[0][0]
+        call_url  = mock_client.post.call_args[0][0]
         assert "/api/maintenance-logs/add" in call_url
 
-        # Verify the payload contains expected fields
         call_json = mock_client.post.call_args[1]["json"]
         assert call_json["machine_id"]   == "TEST_M001"
         assert call_json["failure_type"] == "HDF"
         assert call_json["technician"]   == "test_engineer"
 
     @pytest.mark.asyncio
-    async def test_post_resolution_indexer_skips_on_rejection(
-        self, sample_anomaly_result, sample_root_cause_report
-    ):
-        """When approved=False, the node should NOT call the API and return auto_indexed=False."""
+    async def test_post_resolution_indexer_skips_on_rejection(self):
+        """When approved=False, the node must not call MongoDB or the API."""
         orch = self._make_orch()
         state = {
-            "approved":          False,
-            "approved_by":       "test_engineer",
-            "machine_id":        "TEST_M001",
-            "anomaly_result":    sample_anomaly_result,
-            "root_cause_report": sample_root_cause_report,
+            "approved":    False,
+            "approved_by": "test_engineer",
+            "session_id":  "test-session-001",
         }
 
         with patch("httpx.AsyncClient") as mock_cls:
@@ -287,26 +318,20 @@ class TestPostResolutionIndexer:
         mock_cls.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_post_resolution_indexer_does_not_fail_pipeline_on_error(
-        self, sample_anomaly_result, sample_root_cause_report
-    ):
-        """When httpx raises, the node should return auto_indexed=False without re-raising."""
-        orch = self._make_orch()
+    async def test_post_resolution_indexer_does_not_fail_pipeline_on_error(self):
+        """
+        When mongo_db is None the node cannot locate the alert and must return
+        auto_indexed=False without raising — pipeline resilience is the requirement.
+        """
+        orch = self._make_orch(mongo_db=None)
         state = {
-            "approved":          True,
-            "approved_by":       "test_engineer",
-            "machine_id":        "TEST_M001",
-            "anomaly_result":    sample_anomaly_result,
-            "root_cause_report": sample_root_cause_report,
+            "approved":    True,
+            "approved_by": "test_engineer",
+            "session_id":  "test-session-001",
         }
 
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(side_effect=Exception("Connection refused"))
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__  = AsyncMock(return_value=None)
-
-        with patch("httpx.AsyncClient", return_value=mock_client):
+        with patch("httpx.AsyncClient") as mock_cls:
             result = await orch._node_post_resolution_indexer(state)
 
-        # Must NOT raise — pipeline resilience is the key requirement
         assert result["auto_indexed"] is False
+        mock_cls.assert_not_called()

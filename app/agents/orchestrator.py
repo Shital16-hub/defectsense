@@ -326,10 +326,9 @@ class DefectSenseOrchestrator:
         Only runs when approved=True. Wraps everything in try/except so it
         can never fail the pipeline — a logging failure is not a pipeline failure.
 
-        Data source priority:
-          1. alert object in state (saved before HITL interrupt — always reliable)
-          2. root_cause_report / anomaly_result in state (may be None after MemorySaver resume)
-          3. MongoDB alert document (last resort, keyed by session_id)
+        After LangGraph resume(), aupdate_state only injects the approval fields;
+        all other state keys (alert, anomaly_result, root_cause_report, machine_id,
+        session_id) are absent. MongoDB is therefore the primary data source.
         """
         if state.get("approved") is not True:
             logger.debug(
@@ -343,99 +342,66 @@ class DefectSenseOrchestrator:
             import httpx
             from app.models.maintenance import MaintenanceLog
 
-            # ── Source objects ──────────────────────────────────────────────────
-            alert   = state.get("alert")
-            report  = state.get("root_cause_report")
-            anomaly = state.get("anomaly_result")
+            if self._mongo_db is None:
+                logger.warning("post_resolution_indexer: no mongo_db — cannot find alert")
+                return {"auto_indexed": False}
 
-            # Helper: embedded root_cause_report inside alert (Pydantic or dict)
-            def _alert_rcr():
-                if alert is None:
-                    return None
-                rcr = getattr(alert, "root_cause_report", None)
-                if rcr is None and isinstance(alert, dict):
-                    rcr = alert.get("root_cause_report")
-                return rcr
+            # ── Locate the alert in MongoDB ────────────────────────────────────
+            # Try session_id first (most specific), then machine_id + approved_by
+            alert_doc = None
 
-            # ── machine_id ─────────────────────────────────────────────────────
-            machine_id = (
-                getattr(alert, "machine_id", None)
-                or (alert.get("machine_id") if isinstance(alert, dict) else None)
-                or getattr(report, "machine_id", None)
-                or getattr(anomaly, "machine_id", None)
-                or state.get("machine_id")
-            )
+            session_id      = state.get("session_id")
+            machine_id_hint = state.get("machine_id")
+            approved_by     = state.get("approved_by")
 
-            # ── failure_type ───────────────────────────────────────────────────
-            failure_type = getattr(anomaly, "failure_type_prediction", None)
-            if not failure_type:
-                rcr = _alert_rcr()
-                emb = getattr(rcr, "anomaly_result", None) if rcr else None
-                failure_type = getattr(emb, "failure_type_prediction", None)
+            # Also pull hints from the alert object if it survived in state
+            alert_obj = state.get("alert")
+            if alert_obj is not None:
+                machine_id_hint = machine_id_hint or getattr(alert_obj, "machine_id", None)
+                session_id      = session_id      or getattr(alert_obj, "session_id",  None)
 
-            # ── root_cause / actions / confidence / severity ───────────────────
-            root_cause           = "Unknown"
-            recommended_actions: list = []
-            confidence           = 0.0
-            severity             = "UNKNOWN"
-            sensor_deltas: dict  = {}
+            queries: list[dict] = []
+            if session_id:
+                queries.append({"session_id": session_id})
+            if machine_id_hint and machine_id_hint != "UNKNOWN" and approved_by:
+                queries.append({"machine_id": machine_id_hint, "approved": True, "approved_by": approved_by})
 
-            if report is not None:
-                root_cause          = getattr(report, "root_cause",           "Unknown") or "Unknown"
-                recommended_actions = getattr(report, "recommended_actions",  [])        or []
-                confidence          = getattr(report, "confidence",           0.0)       or 0.0
-                severity            = getattr(report, "severity",             "UNKNOWN") or "UNKNOWN"
-            else:
-                rcr = _alert_rcr()
-                if rcr is not None:
-                    root_cause          = getattr(rcr, "root_cause",          "Unknown") or "Unknown"
-                    recommended_actions = getattr(rcr, "recommended_actions", [])        or []
-                    confidence          = getattr(rcr, "confidence",          0.0)       or 0.0
-                    severity            = getattr(rcr, "severity",            "UNKNOWN") or "UNKNOWN"
-
-            if anomaly is not None:
-                sensor_deltas = getattr(anomaly, "sensor_deltas", {}) or {}
-            else:
-                rcr = _alert_rcr()
-                if rcr is not None:
-                    emb = getattr(rcr, "anomaly_result", None)
-                    if emb is not None:
-                        sensor_deltas = getattr(emb, "sensor_deltas", {}) or {}
-
-            # ── MongoDB fallback if critical fields still missing ───────────────
-            if (not machine_id or machine_id == "UNKNOWN" or not failure_type) and self._mongo_db is not None:
+            for query in queries:
                 try:
-                    session_id = state.get("session_id")
-                    if session_id:
-                        doc = await self._mongo_db["alerts"].find_one(
-                            {"session_id": session_id}, {"_id": 0}
+                    doc = await self._mongo_db["alerts"].find_one(query, {"_id": 0})
+                    if doc:
+                        alert_doc = doc
+                        logger.info(
+                            "post_resolution_indexer: found alert via {} machine_id={}",
+                            list(query.keys()), doc.get("machine_id"),
                         )
-                        if doc:
-                            machine_id   = machine_id or doc.get("machine_id", "UNKNOWN")
-                            rcr_d        = doc.get("root_cause_report", {}) or {}
-                            anom_d       = rcr_d.get("anomaly_result",  {}) or {}
-                            failure_type = failure_type or anom_d.get("failure_type_prediction")
-                            root_cause   = root_cause   if root_cause != "Unknown" else (rcr_d.get("root_cause") or "Unknown")
-                            if not recommended_actions:
-                                recommended_actions = rcr_d.get("recommended_actions", []) or []
-                            confidence   = confidence   or rcr_d.get("confidence", 0.0)   or 0.0
-                            severity     = severity     if severity != "UNKNOWN" else (rcr_d.get("severity") or "UNKNOWN")
-                            if not sensor_deltas:
-                                sensor_deltas = anom_d.get("sensor_deltas", {}) or {}
-                            logger.info(
-                                "post_resolution_indexer: recovered from MongoDB "
-                                "machine_id={} failure_type={}",
-                                machine_id, failure_type,
-                            )
+                        break
                 except Exception as exc:
-                    logger.warning("post_resolution_indexer: MongoDB fallback failed — {}", exc)
+                    logger.warning("post_resolution_indexer: query {} failed — {}", list(query.keys()), exc)
 
-            machine_id   = machine_id   or "UNKNOWN"
-            failure_type = failure_type or "UNKNOWN"
+            if alert_doc is None:
+                logger.warning(
+                    "post_resolution_indexer: alert not found in MongoDB — "
+                    "session_id={} machine_id={}",
+                    session_id, machine_id_hint,
+                )
+                return {"auto_indexed": False}
+
+            # ── Extract fields from the MongoDB document ───────────────────────
+            machine_id  = alert_doc.get("machine_id", "UNKNOWN")
+            rcr         = alert_doc.get("root_cause_report", {}) or {}
+            anom_d      = rcr.get("anomaly_result", {}) or {}
+
+            failure_type        = anom_d.get("failure_type_prediction") or "UNKNOWN"
+            root_cause          = rcr.get("root_cause")          or "Unknown"
+            recommended_actions = rcr.get("recommended_actions", []) or []
+            confidence          = rcr.get("confidence",  0.0)    or 0.0
+            severity            = rcr.get("severity",    "UNKNOWN") or "UNKNOWN"
+            sensor_deltas       = anom_d.get("sensor_deltas", {}) or {}
 
             logger.info(
-                "post_resolution_indexer: machine_id={} failure_type={} conf={:.2f} sev={}",
-                machine_id, failure_type, confidence, severity,
+                "post_resolution_indexer: building log machine_id={} failure_type={} conf={:.2f}",
+                machine_id, failure_type, confidence,
             )
 
             # ── Build symptoms string ──────────────────────────────────────────
@@ -453,7 +419,10 @@ class DefectSenseOrchestrator:
                 human     = label_map.get(key, key.replace("_", " ").title())
                 direction = "above" if val >= 0 else "below"
                 symptom_parts.append(f"{human} {abs(val):.1f} std {direction} normal")
-            symptoms = "; ".join(symptom_parts) if symptom_parts else f"Anomaly detected on {machine_id}"
+            symptoms = (
+                "; ".join(symptom_parts) if symptom_parts
+                else f"Anomaly detected on {machine_id}"
+            )
 
             action_taken = "; ".join(recommended_actions[:2]) if recommended_actions else "Maintenance action required"
             notes = (
@@ -469,7 +438,7 @@ class DefectSenseOrchestrator:
                 root_cause=root_cause,
                 action_taken=action_taken,
                 resolution_time_hours=0.0,
-                technician=state.get("approved_by") or "auto",
+                technician=state.get("approved_by") or alert_doc.get("approved_by") or "auto",
                 notes=notes,
             )
 
@@ -481,7 +450,7 @@ class DefectSenseOrchestrator:
                 resp.raise_for_status()
 
             logger.info(
-                "post_resolution_indexer: success log={} machine={} type={}",
+                "post_resolution_indexer: SUCCESS log={} machine={} type={}",
                 log.log_id[:8], log.machine_id, log.failure_type,
             )
             return {"auto_indexed": True}
