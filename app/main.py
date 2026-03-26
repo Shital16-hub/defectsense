@@ -227,6 +227,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         auto_approve_threshold=float(os.getenv("AUTO_APPROVE_CONFIDENCE_THRESHOLD", "0.95")),
         approval_timeout_minutes=int(os.getenv("HUMAN_APPROVAL_TIMEOUT_MINUTES", "15")),
         app_base_url=os.getenv("APP_BASE_URL", "http://localhost:8080"),
+        mongo_db=mongo_db,
     )
     orchestrator.build()
     app.state.orchestrator = orchestrator

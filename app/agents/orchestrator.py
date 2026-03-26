@@ -88,6 +88,7 @@ class DefectSenseOrchestrator:
         auto_approve_threshold: float = 0.95,
         approval_timeout_minutes: int = 15,
         app_base_url: str = "http://localhost:8080",
+        mongo_db=None,
     ) -> None:
         self._detector          = detector
         self._context_retriever = context_retriever
@@ -97,6 +98,7 @@ class DefectSenseOrchestrator:
         self._auto_threshold    = auto_approve_threshold
         self._timeout_minutes   = approval_timeout_minutes
         self._app_base_url      = app_base_url.rstrip("/")
+        self._mongo_db          = mongo_db
         self._graph: Any        = None
         self._checkpointer      = MemorySaver()
 
@@ -323,6 +325,11 @@ class DefectSenseOrchestrator:
 
         Only runs when approved=True. Wraps everything in try/except so it
         can never fail the pipeline — a logging failure is not a pipeline failure.
+
+        Data source priority:
+          1. alert object in state (saved before HITL interrupt — always reliable)
+          2. root_cause_report / anomaly_result in state (may be None after MemorySaver resume)
+          3. MongoDB alert document (last resort, keyed by session_id)
         """
         if state.get("approved") is not True:
             logger.debug(
@@ -334,28 +341,104 @@ class DefectSenseOrchestrator:
         try:
             from datetime import datetime, timezone
             import httpx
-
             from app.models.maintenance import MaintenanceLog
 
-            report: Optional[RootCauseReport] = state.get("root_cause_report")
-            anomaly: Optional[Any]            = state.get("anomaly_result")
+            # ── Source objects ──────────────────────────────────────────────────
+            alert   = state.get("alert")
+            report  = state.get("root_cause_report")
+            anomaly = state.get("anomaly_result")
 
-            # machine_id: prefer state key, fall back to anomaly_result attribute
+            # Helper: embedded root_cause_report inside alert (Pydantic or dict)
+            def _alert_rcr():
+                if alert is None:
+                    return None
+                rcr = getattr(alert, "root_cause_report", None)
+                if rcr is None and isinstance(alert, dict):
+                    rcr = alert.get("root_cause_report")
+                return rcr
+
+            # ── machine_id ─────────────────────────────────────────────────────
             machine_id = (
-                state.get("machine_id")
+                getattr(alert, "machine_id", None)
+                or (alert.get("machine_id") if isinstance(alert, dict) else None)
+                or getattr(report, "machine_id", None)
                 or getattr(anomaly, "machine_id", None)
-                or "UNKNOWN"
-            )
-            logger.info(
-                "post_resolution_indexer: state.keys={} machine_id={} anomaly.machine_id={}",
-                sorted(state.keys()),
-                state.get("machine_id"),
-                getattr(anomaly, "machine_id", None),
+                or state.get("machine_id")
             )
 
-            # Build symptoms string from sensor_deltas
-            deltas = getattr(anomaly, "sensor_deltas", {}) or {}
-            symptom_parts = []
+            # ── failure_type ───────────────────────────────────────────────────
+            failure_type = getattr(anomaly, "failure_type_prediction", None)
+            if not failure_type:
+                rcr = _alert_rcr()
+                emb = getattr(rcr, "anomaly_result", None) if rcr else None
+                failure_type = getattr(emb, "failure_type_prediction", None)
+
+            # ── root_cause / actions / confidence / severity ───────────────────
+            root_cause           = "Unknown"
+            recommended_actions: list = []
+            confidence           = 0.0
+            severity             = "UNKNOWN"
+            sensor_deltas: dict  = {}
+
+            if report is not None:
+                root_cause          = getattr(report, "root_cause",           "Unknown") or "Unknown"
+                recommended_actions = getattr(report, "recommended_actions",  [])        or []
+                confidence          = getattr(report, "confidence",           0.0)       or 0.0
+                severity            = getattr(report, "severity",             "UNKNOWN") or "UNKNOWN"
+            else:
+                rcr = _alert_rcr()
+                if rcr is not None:
+                    root_cause          = getattr(rcr, "root_cause",          "Unknown") or "Unknown"
+                    recommended_actions = getattr(rcr, "recommended_actions", [])        or []
+                    confidence          = getattr(rcr, "confidence",          0.0)       or 0.0
+                    severity            = getattr(rcr, "severity",            "UNKNOWN") or "UNKNOWN"
+
+            if anomaly is not None:
+                sensor_deltas = getattr(anomaly, "sensor_deltas", {}) or {}
+            else:
+                rcr = _alert_rcr()
+                if rcr is not None:
+                    emb = getattr(rcr, "anomaly_result", None)
+                    if emb is not None:
+                        sensor_deltas = getattr(emb, "sensor_deltas", {}) or {}
+
+            # ── MongoDB fallback if critical fields still missing ───────────────
+            if (not machine_id or machine_id == "UNKNOWN" or not failure_type) and self._mongo_db is not None:
+                try:
+                    session_id = state.get("session_id")
+                    if session_id:
+                        doc = await self._mongo_db["alerts"].find_one(
+                            {"session_id": session_id}, {"_id": 0}
+                        )
+                        if doc:
+                            machine_id   = machine_id or doc.get("machine_id", "UNKNOWN")
+                            rcr_d        = doc.get("root_cause_report", {}) or {}
+                            anom_d       = rcr_d.get("anomaly_result",  {}) or {}
+                            failure_type = failure_type or anom_d.get("failure_type_prediction")
+                            root_cause   = root_cause   if root_cause != "Unknown" else (rcr_d.get("root_cause") or "Unknown")
+                            if not recommended_actions:
+                                recommended_actions = rcr_d.get("recommended_actions", []) or []
+                            confidence   = confidence   or rcr_d.get("confidence", 0.0)   or 0.0
+                            severity     = severity     if severity != "UNKNOWN" else (rcr_d.get("severity") or "UNKNOWN")
+                            if not sensor_deltas:
+                                sensor_deltas = anom_d.get("sensor_deltas", {}) or {}
+                            logger.info(
+                                "post_resolution_indexer: recovered from MongoDB "
+                                "machine_id={} failure_type={}",
+                                machine_id, failure_type,
+                            )
+                except Exception as exc:
+                    logger.warning("post_resolution_indexer: MongoDB fallback failed — {}", exc)
+
+            machine_id   = machine_id   or "UNKNOWN"
+            failure_type = failure_type or "UNKNOWN"
+
+            logger.info(
+                "post_resolution_indexer: machine_id={} failure_type={} conf={:.2f} sev={}",
+                machine_id, failure_type, confidence, severity,
+            )
+
+            # ── Build symptoms string ──────────────────────────────────────────
             label_map = {
                 "air_temperature":     "Air temperature",
                 "process_temperature": "Process temperature",
@@ -363,23 +446,16 @@ class DefectSenseOrchestrator:
                 "torque":              "Torque",
                 "tool_wear":           "Tool wear",
             }
-            for key, val in deltas.items():
+            symptom_parts = []
+            for key, val in sensor_deltas.items():
                 if val is None:
                     continue
-                human = label_map.get(key, key.replace("_", " ").title())
+                human     = label_map.get(key, key.replace("_", " ").title())
                 direction = "above" if val >= 0 else "below"
                 symptom_parts.append(f"{human} {abs(val):.1f} std {direction} normal")
-            symptoms = "; ".join(symptom_parts) if symptom_parts else (
-                f"Anomaly detected on {machine_id}"
-            )
+            symptoms = "; ".join(symptom_parts) if symptom_parts else f"Anomaly detected on {machine_id}"
 
-            # action_taken: first 2 recommended actions
-            actions = (report.recommended_actions if report else []) or []
-            action_taken = "; ".join(actions[:2]) if actions else "Maintenance action required"
-
-            # notes with confidence and severity
-            confidence = report.confidence if report else 0.0
-            severity   = report.severity   if report else "UNKNOWN"
+            action_taken = "; ".join(recommended_actions[:2]) if recommended_actions else "Maintenance action required"
             notes = (
                 f"Auto-indexed from DefectSense alert. "
                 f"Confidence: {confidence:.0%}. Severity: {severity}."
@@ -388,22 +464,13 @@ class DefectSenseOrchestrator:
             log = MaintenanceLog(
                 machine_id=machine_id,
                 date=datetime.now(tz=timezone.utc),
-                failure_type=(
-                    getattr(anomaly, "failure_type_prediction", None) or "UNKNOWN"
-                ),
+                failure_type=failure_type,
                 symptoms=symptoms,
-                root_cause=report.root_cause if report else "Unknown",
+                root_cause=root_cause,
                 action_taken=action_taken,
                 resolution_time_hours=0.0,
                 technician=state.get("approved_by") or "auto",
                 notes=notes,
-            )
-
-            logger.info(
-                "post_resolution_indexer: creating log machine_id={} failure_type={} notes={}",
-                log.machine_id,
-                log.failure_type,
-                log.notes[:80],
             )
 
             async with httpx.AsyncClient(timeout=30) as client:
@@ -414,7 +481,7 @@ class DefectSenseOrchestrator:
                 resp.raise_for_status()
 
             logger.info(
-                "Orchestrator[post_resolution_indexer]: log {} indexed | machine={} type={}",
+                "post_resolution_indexer: success log={} machine={} type={}",
                 log.log_id[:8], log.machine_id, log.failure_type,
             )
             return {"auto_indexed": True}
