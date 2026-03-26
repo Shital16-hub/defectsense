@@ -28,6 +28,11 @@ from loguru import logger
 
 load_dotenv()
 
+# Disable LangSmith tracing if quota exceeded or not needed
+import os as _os
+if not _os.getenv("LANGCHAIN_TRACING_FORCE", ""):
+    _os.environ["LANGCHAIN_TRACING_V2"] = "false"
+
 # ── Background task: approval timeout checker ──────────────────────────────────
 
 _pending_threads: dict[str, str] = {}  # thread_id → ISO timeout datetime

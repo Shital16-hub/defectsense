@@ -404,25 +404,62 @@ class DefectSenseOrchestrator:
                 machine_id, failure_type, confidence,
             )
 
-            # ── Build symptoms string ──────────────────────────────────────────
-            label_map = {
-                "air_temperature":     "Air temperature",
-                "process_temperature": "Process temperature",
-                "rotational_speed":    "Rotational speed",
-                "torque":              "Torque",
-                "tool_wear":           "Tool wear",
-            }
-            symptom_parts = []
-            for key, val in sensor_deltas.items():
-                if val is None:
-                    continue
-                human     = label_map.get(key, key.replace("_", " ").title())
-                direction = "above" if val >= 0 else "below"
-                symptom_parts.append(f"{human} {abs(val):.1f} std {direction} normal")
-            symptoms = (
-                "; ".join(symptom_parts) if symptom_parts
-                else f"Anomaly detected on {machine_id}"
-            )
+            # ── Build human-readable symptoms string ───────────────────────────
+            def _build_human_symptoms(
+                sensor_deltas: dict, failure_type: str, machine_id: str
+            ) -> str:
+                """
+                Convert z-score sensor deltas into natural language symptoms
+                that match the vocabulary of the RAG maintenance corpus.
+                """
+                if not sensor_deltas:
+                    return f"Anomaly detected on {machine_id}"
+
+                HIGH_Z = 2.0
+                MED_Z  = 1.0
+
+                parts: list[str] = []
+
+                pt = sensor_deltas.get("process_temperature", 0.0) or 0.0
+                at = sensor_deltas.get("air_temperature",     0.0) or 0.0
+                rs = sensor_deltas.get("rotational_speed",    0.0) or 0.0
+                tq = sensor_deltas.get("torque",              0.0) or 0.0
+                tw = sensor_deltas.get("tool_wear",           0.0) or 0.0
+
+                if abs(pt) >= HIGH_Z:
+                    parts.append(f"Process temperature significantly {'elevated' if pt > 0 else 'below normal'}")
+                elif abs(pt) >= MED_Z:
+                    parts.append(f"Process temperature {'elevated' if pt > 0 else 'below normal'}")
+
+                if abs(at) >= HIGH_Z:
+                    parts.append(f"Air temperature significantly {'elevated' if at > 0 else 'below normal'}")
+
+                if abs(rs) >= HIGH_Z:
+                    parts.append("Rotational speed dropped significantly below rated RPM" if rs < 0 else "Rotational speed elevated")
+                elif abs(rs) >= MED_Z:
+                    parts.append(f"Rotational speed {'reduced' if rs < 0 else 'increased'}")
+
+                if abs(tq) >= HIGH_Z:
+                    parts.append("Torque high — possible mechanical overload" if tq > 0 else "Torque low")
+                elif abs(tq) >= MED_Z:
+                    parts.append(f"Torque {'above' if tq > 0 else 'below'} normal range")
+
+                if abs(tw) >= MED_Z:
+                    parts.append("Tool wear indicator elevated")
+
+                failure_context = {
+                    "HDF": "thermal alarm conditions detected, possible cooling system issue",
+                    "TWF": "tool wear exceeded normal tolerance",
+                    "PWF": "power consumption outside normal operating range",
+                    "OSF": "mechanical overload detected, torque spike recorded",
+                    "RNF": "unexpected fault with no single dominant cause",
+                }
+                if failure_type in failure_context and failure_type != "UNKNOWN":
+                    parts.append(failure_context[failure_type])
+
+                return "; ".join(parts) if parts else f"Multiple sensor deviations detected on {machine_id}"
+
+            symptoms = _build_human_symptoms(sensor_deltas, failure_type, machine_id)
 
             action_taken = "; ".join(recommended_actions[:2]) if recommended_actions else "Maintenance action required"
             notes = (

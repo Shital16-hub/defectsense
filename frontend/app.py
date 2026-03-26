@@ -410,7 +410,9 @@ def _score_card(label: str, score: float) -> str:
 
 def run_evaluation_now() -> str:
     resp = _get("/api/evaluation/run")
-    return resp.get("message", str(resp))
+    if "error" in resp:
+        return f"Error: {resp['error']}"
+    return "✓ Evaluation started — refresh in ~2 minutes"
 
 
 def load_evaluation_results():
@@ -459,14 +461,22 @@ def load_evaluation_results():
     # ── History table ─────────────────────────────────────────────────────────
     history_rows = []
     for r in (history.get("results", []) if isinstance(history, dict) else []):
-        s       = r.get("scores", {})
-        run_at  = r.get("run_at", "")[:19].replace("T", " ")
-        et      = r.get("eval_type", "")
-        cp      = f"{s.get('context_precision', 0)*100:.1f}%" if et == "rag" else "—"
-        fa      = f"{s.get('faithfulness',      0)*100:.1f}%" if et == "rag" else "—"
-        ar      = f"{s.get('answer_relevancy',  0)*100:.1f}%" if et == "rag" else "—"
-        overall = f"{s.get('overall', 0)*100:.1f}%"
-        history_rows.append([run_at, et, cp, fa, ar, overall])
+        s      = r.get("scores", {})
+        run_at = r.get("run_at", "")[:19].replace("T", " ")
+        et     = r.get("eval_type", "")
+        if et == "rag":
+            label   = "RAG"
+            cp      = f"{s.get('context_precision', 0) * 100:.1f}%"
+            fa      = f"{s.get('faithfulness',      0) * 100:.1f}%"
+            ar      = f"{s.get('answer_relevancy',  0) * 100:.1f}%"
+            overall = f"{s.get('overall', 0) * 100:.1f}%"
+        else:
+            label   = "LLM Judge"
+            cp      = "—"
+            fa      = "—"
+            ar      = "—"
+            overall = f"{s.get('overall', 0) * 100:.1f}%"
+        history_rows.append([run_at, label, cp, fa, ar, overall])
 
     # ── Sample scores from latest RAG eval ────────────────────────────────────
     sample_rows = []
@@ -681,7 +691,7 @@ def build_app() -> gr.Blocks:
 
                 gr.Markdown("#### Evaluation History")
                 t6_history_tbl = gr.Dataframe(
-                    headers=["Run Time", "Type", "Context Precision", "Faithfulness", "Answer Relevancy", "Overall"],
+                    headers=["Run Time", "Type", "Ctx Precision", "Faithfulness", "Ans Relevancy", "Overall"],
                     interactive=False,
                     wrap=True,
                     label="History (last 20)",
