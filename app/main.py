@@ -100,6 +100,25 @@ async def _approval_timeout_loop(app: FastAPI) -> None:
             logger.warning("Timeout checker error: {}", exc)
 
 
+# ── Scheduled task: nightly drift check ────────────────────────────────────────
+
+async def run_drift_check(app: FastAPI) -> None:
+    """APScheduler job — runs at 03:00 UTC."""
+    logger.info("Nightly drift check: starting")
+    try:
+        drift_svc = getattr(app.state, "drift_monitor", None)
+        redis_svc = getattr(app.state, "redis", None)
+        if drift_svc and redis_svc:
+            result = await drift_svc.run_full_drift_check(redis_svc)
+            logger.info(
+                "Drift check complete: is_drifted={} share={:.0%}",
+                result.get("is_drifted"),
+                result.get("drift_share", 0),
+            )
+    except Exception as exc:
+        logger.warning("Drift check failed (non-fatal): {}", exc)
+
+
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -109,9 +128,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("  DefectSense — starting up")
     logger.info("=" * 60)
 
+    # ── Azure Blob Storage Service ─────────────────────────────────────────────
+    from app.services.blob_storage_service import BlobStorageService
+    blob_service = BlobStorageService(
+        connection_string=os.getenv("AZURE_STORAGE_CONNECTION_STRING"),
+        container_name=os.getenv("AZURE_STORAGE_CONTAINER", "defectsense-models"),
+    )
+    app.state.blob_storage = blob_service
+
     # ── ML Service ─────────────────────────────────────────────────────────────
     from app.services.ml_service import MLService
-    ml_service = MLService()
+    ml_service = MLService(blob_service=blob_service)
     ml_service.load()
     app.state.ml = ml_service
 
@@ -121,6 +148,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     redis_service = RedisService(url=redis_url)
     await redis_service.init()
     app.state.redis = redis_service
+
+    # ── PostgreSQL (optional) ──────────────────────────────────────────────────
+    from app.services.postgres_service import PostgresService
+    postgres_service = PostgresService(os.getenv("POSTGRES_URL"))
+    postgres_service.init()
+    app.state.postgres = postgres_service
+    if postgres_service.is_connected:
+        row_count = postgres_service.get_row_count()
+        logger.info("PostgreSQL: connected ({:,} rows)", row_count)
+    else:
+        logger.warning("PostgreSQL: unavailable (degraded)")
 
     # ── MongoDB (optional) ─────────────────────────────────────────────────────
     mongo_db = None
@@ -259,6 +297,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.llm_judge_service = llm_judge_service
     logger.info("Evaluation services: RAG + LLM-Judge ready")
 
+    # ── Drift Monitoring Service ───────────────────────────────────────────────
+    from app.services.drift_monitoring_service import DriftMonitoringService
+    drift_service = DriftMonitoringService(
+        mongo_db=mongo_db,
+        postgres_url=os.getenv("POSTGRES_URL"),
+    )
+    try:
+        await drift_service.init()
+        logger.info("DriftMonitoringService: ready")
+    except Exception as exc:
+        logger.warning("DriftMonitoringService init failed: {}", exc)
+    app.state.drift_monitor = drift_service
+
     # ── Evaluation Scheduler ───────────────────────────────────────────────────
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     scheduler = AsyncIOScheduler(timezone="UTC")
@@ -271,8 +322,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         id="nightly_evaluation",
         replace_existing=True,
     )
+    scheduler.add_job(
+        run_drift_check,
+        "cron",
+        hour=3,
+        minute=0,
+        args=[app],
+        id="nightly_drift_check",
+        replace_existing=True,
+    )
     scheduler.start()
     logger.info("Evaluation scheduler: nightly job scheduled at 02:00 UTC")
+    logger.info("Drift check scheduler: nightly job scheduled at 03:00 UTC")
 
     # ── Background: approval timeout checker ───────────────────────────────────
     timeout_task = asyncio.create_task(_approval_timeout_loop(app))
@@ -287,6 +348,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     scheduler.shutdown()
     logger.info("DefectSense: shutting down")
     await redis_service.close()
+    postgres_service.close()
     logger.info("DefectSense: goodbye")
 
 
@@ -327,6 +389,8 @@ def create_app() -> FastAPI:
         return {
             "status":              "ok",
             "ml_ready":            app.state.ml.is_ready,
+            "blob_storage_ready":  getattr(app.state, "blob_storage", None) is not None
+                                   and app.state.blob_storage.is_available,
             "redis_connected":     app.state.redis.is_connected,
             "mongo_connected":     app.state.mongo_db is not None,
             "qdrant_connected":    app.state.qdrant is not None,
@@ -336,6 +400,10 @@ def create_app() -> FastAPI:
             "reasoner_ready":      True,
             "alert_generator_ready": True,
             "orchestrator_ready":  app.state.orchestrator is not None,
+            "postgres_ready":      getattr(app.state, "postgres", None) is not None
+                                   and app.state.postgres.is_connected,
+            "drift_monitor_ready": getattr(app.state, "drift_monitor", None) is not None
+                                   and app.state.drift_monitor.is_ready,
         }
 
     return app

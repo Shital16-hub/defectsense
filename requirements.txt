@@ -53,3 +53,11 @@ langsmith==0.7.22
 websockets==16.0
 python-multipart==0.0.22
 aiofiles==24.1.0
+
+apscheduler==3.10.4
+
+# ─── Drift Monitoring ─────────────────────────────────────────────────────────
+evidently==0.7.21
+
+# ─── Azure ────────────────────────────────────────────────────────────────────
+azure-storage-blob==12.25.1

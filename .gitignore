@@ -16,10 +16,12 @@ build/
 .env.local
 .env.*.local
 
-# ML models (large binaries — tracked via MLflow / DVC)
+# ML Models — never commit, always retrain
 ml/models/*.keras
 ml/models/*.h5
 ml/models/*.pkl
+ml/models/*.pt
+ml/models/*.bin
 
 # Data (large files — download via script)
 data/*.csv
@@ -28,6 +30,8 @@ data/*.parquet
 
 # MLflow
 mlruns/
+mlflow.db
+mlruns/mlflow.db
 
 # IDE
 .vscode/

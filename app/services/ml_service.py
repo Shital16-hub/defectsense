@@ -60,15 +60,19 @@ class MLService:
     """
     Stateless ML inference service — no internal rolling buffer.
     The caller (AnomalyDetectorAgent) supplies the pre-built sequence from Redis.
+
+    If blob_service is provided and local model files are missing, the service
+    will attempt to download them from Azure Blob Storage before loading.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, blob_service=None) -> None:
         self._autoencoder   = None
         self._scaler        = None
         self._threshold_data: dict = {}
         self._iforest       = None
         self._loaded        = False
         self._executor      = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        self._blob_service  = blob_service  # optional BlobStorageService
 
         # MLflow prediction tracking
         self._mlflow_run_id: Optional[str] = None
@@ -78,25 +82,44 @@ class MLService:
     # ── Loading ────────────────────────────────────────────────────────────────
 
     def load(self) -> None:
-        """Load all model artefacts from disk. Call once at app startup."""
+        """Load all model artefacts from disk. Call once at app startup.
+
+        If a local file is missing and a BlobStorageService was supplied, the
+        method attempts to download the 'latest' blob variant before loading.
+        """
         if self._loaded:
             return
 
         logger.info("MLService: loading artefacts from {}", MODELS_DIR)
 
-        if AUTOENCODER_PATH.exists():
+        # ── helper: try blob download if local file missing ───────────────────
+        def _ensure_local(path: Path, blob_name: str) -> bool:
+            if path.exists():
+                return True
+            if self._blob_service is not None and self._blob_service.is_available:
+                logger.info("  MLService: '{}' missing locally — downloading from blob...", path.name)
+                ok = self._blob_service.download_model(blob_name, path)
+                if ok:
+                    return True
+                logger.error("  MLService: blob download failed for '{}'", blob_name)
+            return False
+
+        # ── LSTM Autoencoder ─────────────────────────────────────────────────
+        if _ensure_local(AUTOENCODER_PATH, "lstm_autoencoder_latest.keras"):
             import tensorflow as tf  # deferred — slow import
             self._autoencoder = tf.keras.models.load_model(str(AUTOENCODER_PATH))
             logger.info("  ✓ LSTM Autoencoder loaded")
         else:
             logger.warning("  ✗ Autoencoder not found — run ml/train_autoencoder.py")
 
-        if SCALER_PATH.exists():
+        # ── Sensor scaler ────────────────────────────────────────────────────
+        if _ensure_local(SCALER_PATH, "sensor_scaler_latest.pkl"):
             with open(SCALER_PATH, "rb") as f:
                 self._scaler = pickle.load(f)
             logger.info("  ✓ Sensor scaler loaded")
 
-        if THRESHOLD_PATH.exists():
+        # ── Anomaly threshold ────────────────────────────────────────────────
+        if _ensure_local(THRESHOLD_PATH, "anomaly_threshold_latest.pkl"):
             with open(THRESHOLD_PATH, "rb") as f:
                 self._threshold_data = pickle.load(f)
             logger.info(
@@ -104,7 +127,8 @@ class MLService:
                 self._threshold_data.get("threshold", 0.0),
             )
 
-        if IFOREST_PATH.exists():
+        # ── Isolation Forest ─────────────────────────────────────────────────
+        if _ensure_local(IFOREST_PATH, "isolation_forest_latest.pkl"):
             with open(IFOREST_PATH, "rb") as f:
                 iforest_data = pickle.load(f)
             # pkl was saved as a dict: {"model": ..., "scaler": ..., ...}
@@ -124,6 +148,13 @@ class MLService:
     def is_ready(self) -> bool:
         return self._loaded and (
             self._autoencoder is not None or self._iforest is not None
+        )
+
+    @property
+    def is_blob_available(self) -> bool:
+        return (
+            self._blob_service is not None
+            and self._blob_service.is_available
         )
 
     # ── Public API ─────────────────────────────────────────────────────────────
@@ -238,8 +269,10 @@ class MLService:
 
     def _init_mlflow(self) -> None:
         try:
+            import os
             import mlflow
-            mlflow.set_tracking_uri("./mlruns")
+            tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlruns/mlflow.db")
+            mlflow.set_tracking_uri(tracking_uri)
             mlflow.set_experiment("defectsense_live_predictions")
             run = mlflow.start_run(run_name="live_inference")
             self._mlflow_run_id = run.info.run_id

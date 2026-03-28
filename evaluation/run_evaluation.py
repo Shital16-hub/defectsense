@@ -196,6 +196,39 @@ def main():
     for name, m in results["models"].items():
         print(f"{name:<22} {m['precision']:>10.4f} {m['recall']:>8.4f} {m['f1']:>8.4f} {m['auc']:>8.4f}")
 
+    # ── Compare against registered Production model ────────────────────────────
+    try:
+        sys.path.insert(0, str(ROOT))
+        from ml.model_registry_service import ModelRegistryService
+        registry = ModelRegistryService()
+        registry.init()
+
+        prod = registry.get_latest_version(
+            "defectsense_isolation_forest",
+            stage="Production",   # maps to alias "champion"
+        )
+
+        if prod:
+            prod_auc     = prod["metrics"].get("auc", 0.0)
+            current_auc  = results["models"]["isolation_forest"]["auc"]
+
+            print("\n=== Champion Comparison ===")
+            print(f"{'Metric':<12} {'Current':>10} {'Champion':>12} {'Better?':>8}")
+            print("-" * 45)
+            print(
+                f"{'AUC':<12} {current_auc:>10.4f} {prod_auc:>12.4f} "
+                f"{'YES' if current_auc > prod_auc else 'NO':>8}"
+            )
+
+            if current_auc > prod_auc:
+                print("\nRECOMMENDATION: Promote to champion")
+                print("Run: python ml/promote_to_production.py --model iforest --version X")
+        else:
+            print("\nNo champion model registered.")
+            print("Run: python ml/promote_to_production.py --model iforest --version 1")
+    except Exception as exc:
+        print(f"Registry check skipped: {exc}")
+
     return results
 
 

@@ -20,7 +20,13 @@ Outputs:
 import os
 import pickle
 import sys
+from datetime import date
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env from project root
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 import mlflow
 import mlflow.keras
@@ -52,27 +58,48 @@ def load_and_prepare(path: Path) -> tuple[np.ndarray, np.ndarray, object]:
     """Load CSV, filter normal samples, scale, create sequences."""
     from sklearn.preprocessing import MinMaxScaler
 
-    if not path.exists():
-        print(f"ERROR: Dataset not found at {path}")
-        print("Run:  python data/download_data.py  first.")
+    # ── Try PostgreSQL first ───────────────────────────────────────────────────
+    normal = pd.DataFrame()
+    try:
+        from app.services.postgres_service import PostgresService
+        pg = PostgresService(os.getenv("POSTGRES_URL"))
+        pg.init()
+        if pg.is_connected:
+            pg_normal = pg.get_normal_samples()
+            if len(pg_normal) > 100 and all(f in pg_normal.columns for f in FEATURES):
+                normal = pg_normal[FEATURES].dropna()
+                print(f"Training data source: PostgreSQL ({len(normal):,} normal samples)")
+            pg.close()
+    except Exception as _exc:
+        pass  # fall through to CSV
+
+    # ── Fall back to CSV ───────────────────────────────────────────────────────
+    if normal.empty:
+        print("Training data source: CSV fallback")
+        if not path.exists():
+            print(f"ERROR: Dataset not found at {path}")
+            print("Run:  python data/download_data.py  first.")
+            sys.exit(1)
+
+        df = pd.read_csv(path)
+
+        # Handle both original column names and renamed ones
+        col_map = {
+            "Air temperature [K]": "air_temperature",
+            "Process temperature [K]": "process_temperature",
+            "Rotational speed [rpm]": "rotational_speed",
+            "Torque [Nm]": "torque",
+            "Tool wear [min]": "tool_wear",
+            "Machine failure": "machine_failure",
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+        normal = df[df["machine_failure"] == 0][FEATURES].dropna()
+        print(f"Normal samples : {len(normal):,} / {len(df):,} total")
+
+    if normal.empty:
+        print("ERROR: No normal samples available from PostgreSQL or CSV.")
         sys.exit(1)
-
-    df = pd.read_csv(path)
-
-    # Handle both original column names and renamed ones
-    col_map = {
-        "Air temperature [K]": "air_temperature",
-        "Process temperature [K]": "process_temperature",
-        "Rotational speed [rpm]": "rotational_speed",
-        "Torque [Nm]": "torque",
-        "Tool wear [min]": "tool_wear",
-        "Machine failure": "machine_failure",
-    }
-    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-
-    # Filter normal samples only for training
-    normal = df[df["machine_failure"] == 0][FEATURES].dropna()
-    print(f"Normal samples : {len(normal):,} / {len(df):,} total")
 
     # Scale to [0, 1]
     scaler = MinMaxScaler()
@@ -120,6 +147,50 @@ def compute_threshold(model, val_sequences: np.ndarray) -> tuple[float, float, f
     return threshold, mean_err, std_err
 
 
+def compute_post_training_auc(model, scaler, data_path: Path) -> float:
+    """Compute ROC-AUC on the held-out test split (last 20% of CSV).
+
+    Uses the same sliding-window approach as evaluation/run_evaluation.py.
+    Falls back to 0.0 if the CSV is unavailable or AUC cannot be computed.
+    """
+    try:
+        from sklearn.metrics import roc_auc_score
+
+        if not data_path.exists():
+            return 0.0
+
+        df = pd.read_csv(data_path)
+        col_map = {
+            "Air temperature [K]": "air_temperature",
+            "Process temperature [K]": "process_temperature",
+            "Rotational speed [rpm]": "rotational_speed",
+            "Torque [Nm]": "torque",
+            "Tool wear [min]": "tool_wear",
+            "Machine failure": "machine_failure",
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+        split = int(len(df) * 0.8)
+        test = df.iloc[split:].reset_index(drop=True)
+
+        X_all = scaler.transform(test[FEATURES].values).astype(np.float32)
+        y_true = test["machine_failure"].values.astype(int)
+
+        # Build all sequences as a single batch for efficient prediction
+        seqs = np.array(
+            [X_all[i - SEQUENCE_LENGTH : i] for i in range(SEQUENCE_LENGTH, len(X_all))],
+            dtype=np.float32,
+        )
+        labels = y_true[SEQUENCE_LENGTH:]
+
+        recon  = model.predict(seqs, verbose=0)
+        errors = np.mean(np.power(seqs - recon, 2), axis=(1, 2))
+
+        return float(roc_auc_score(labels, errors))
+    except Exception:
+        return 0.0
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -146,7 +217,9 @@ def main() -> None:
     print()
 
     # ── MLflow Tracking ───────────────────────────────────────────────────────
-    mlflow.set_tracking_uri("./mlruns")
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlruns/mlflow.db")
+    Path(tracking_uri.replace("sqlite:///", "")).parent.mkdir(parents=True, exist_ok=True)
+    mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment("defectsense_anomaly_detection")
 
     with mlflow.start_run(run_name="lstm_autoencoder"):
@@ -180,17 +253,22 @@ def main() -> None:
             verbose=1,
         )
 
-        # Compute threshold
+        # Compute threshold and post-training AUC
         threshold, mean_err, std_err = compute_threshold(model, val_seq)
         train_loss = float(history.history["loss"][-1])
-        val_loss = float(history.history["val_loss"][-1])
+        val_loss   = float(history.history["val_loss"][-1])
+
+        print("\nComputing post-training AUC on test split...")
+        auc = compute_post_training_auc(model, scaler, DATA_PATH)
+        print(f"  AUC (test split): {auc:.4f}")
 
         mlflow.log_metrics({
-            "final_train_loss": train_loss,
-            "final_val_loss": val_loss,
+            "final_train_loss":          train_loss,
+            "final_val_loss":            val_loss,
             "reconstruction_error_mean": mean_err,
-            "reconstruction_error_std": std_err,
-            "anomaly_threshold": threshold,
+            "reconstruction_error_std":  std_err,
+            "anomaly_threshold":         threshold,
+            "auc":                       round(auc, 4),
         })
 
         # Save model
@@ -219,18 +297,86 @@ def main() -> None:
             pickle.dump(threshold_data, f)
         print(f"Threshold saved  → {threshold_path}")
 
+        # ── Azure Blob Upload ──────────────────────────────────────────────────
+        today = date.today().strftime("%Y%m%d")
+        print("\nUploading artefacts to Azure Blob Storage...")
+        azure_ok = _upload_to_azure([
+            (model_path,     "lstm_autoencoder_latest.keras"),
+            (model_path,     f"lstm_autoencoder_{today}.keras"),
+            (scaler_path,    "sensor_scaler_latest.pkl"),
+            (threshold_path, "anomaly_threshold_latest.pkl"),
+        ])
+
+        # ── MLflow Model Registry ──────────────────────────────────────────────
+        registered_version = None
+        try:
+            sys.path.insert(0, str(ROOT))
+            from ml.model_registry_service import ModelRegistryService
+            registry = ModelRegistryService()
+            registry.init()
+
+            model_uri = (
+                f"runs:/{mlflow.active_run().info.run_id}"
+                f"/lstm_autoencoder"
+            )
+            result = mlflow.register_model(
+                model_uri=model_uri,
+                name="defectsense_lstm_autoencoder",
+            )
+
+            client = mlflow.tracking.MlflowClient()
+            client.set_registered_model_alias(
+                name="defectsense_lstm_autoencoder",
+                alias="challenger",
+                version=result.version,
+            )
+            registered_version = result.version
+        except Exception as exc:
+            print(f"Registry warning (non-fatal): {exc}")
+
+        # ── Final Summary ──────────────────────────────────────────────────────
         print()
         print("=" * 60)
-        print("  Training Complete")
+        print("  LSTM Autoencoder Training Complete")
         print("=" * 60)
-        print(f"  Final train loss : {train_loss:.6f}")
-        print(f"  Final val loss   : {val_loss:.6f}")
-        print(f"  Recon error mean : {mean_err:.6f}")
-        print(f"  Recon error std  : {std_err:.6f}")
-        print(f"  Anomaly threshold: {threshold:.6f}  (mean + {THRESHOLD_MULTIPLIER}×std)")
-        print()
-        print(f"  Model trained. Threshold: {threshold:.4f}. Saved to ml/models/")
+        reg_str   = f"defectsense_lstm_autoencoder v{registered_version}" if registered_version else "FAILED (see above)"
+        azure_str = "lstm_autoencoder_latest.keras [OK]" if azure_ok else "skipped / failed (see above)"
+        print(f"  Local:    ml/models/lstm_autoencoder.keras")
+        print(f"  Azure:    {azure_str}")
+        print(f"  Registry: {reg_str}")
+        print(f"  Alias:    challenger")
+        print(f"  AUC:      {auc:.4f}")
         print("=" * 60)
+
+
+# ── Azure Blob Upload helper ───────────────────────────────────────────────────
+
+def _upload_to_azure(uploads: list[tuple[Path, str]]) -> bool:
+    """Upload model files to Azure Blob. Returns True if all uploads succeeded."""
+    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    container_name = os.getenv("AZURE_STORAGE_CONTAINER", "defectsense-models")
+
+    if not connection_string:
+        print("Azure: AZURE_STORAGE_CONNECTION_STRING not set — skipping upload.")
+        return False
+
+    try:
+        sys.path.insert(0, str(ROOT))
+        from app.services.blob_storage_service import BlobStorageService  # noqa: PLC0415
+        blob_service = BlobStorageService(connection_string, container_name)
+        if not blob_service.is_available:
+            print("Azure: blob storage unavailable — skipping upload.")
+            return False
+        all_ok = True
+        for local_path, blob_name in uploads:
+            ok = blob_service.upload_model(local_path, blob_name)
+            status = "OK" if ok else "FAILED"
+            all_ok = all_ok and ok
+            print(f"  Azure upload [{status:6s}]: {blob_name}")
+        return all_ok
+    except Exception as exc:
+        print(f"  Azure upload error (non-fatal): {exc}")
+        return False
 
 
 if __name__ == "__main__":

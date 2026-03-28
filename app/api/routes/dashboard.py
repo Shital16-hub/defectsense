@@ -47,6 +47,8 @@ async def dashboard_stats(request: Request):
         "avg_resolution_time_minutes": None,
         "failure_type_distribution":  {},
         "alerts_by_severity":         {},
+        "drift_detected":             None,
+        "last_drift_check":           None,
         "as_of":                      now.isoformat(),
     }
 
@@ -128,6 +130,17 @@ async def dashboard_stats(request: Request):
         ]
         rows = await db["alerts"].aggregate(pipeline).to_list(10)
         stats["alerts_by_severity"] = {r["_id"]: r["count"] for r in rows if r["_id"]}
+    except Exception:
+        pass
+
+    # ── Latest drift report ────────────────────────────────────────────────────
+    try:
+        drift_docs = await db["drift_reports"].find(
+            {}, {"_id": 0, "is_drifted": 1, "run_at": 1}
+        ).sort("run_at", -1).limit(1).to_list(length=1)
+        if drift_docs:
+            stats["drift_detected"]  = drift_docs[0].get("is_drifted")
+            stats["last_drift_check"] = drift_docs[0].get("run_at")
     except Exception:
         pass
 
