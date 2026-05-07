@@ -3,10 +3,8 @@ DefectSense — MLflow Model Registry CLI  (MLflow 3.x aliases API)
 
 Usage:
     python ml/promote_to_production.py --list
-    python ml/promote_to_production.py --model lstm    --version 1
-    python ml/promote_to_production.py --model iforest --version 1
-    python ml/promote_to_production.py --model lstm    --rollback
-    python ml/promote_to_production.py --model iforest --rollback
+    python ml/promote_to_production.py --model lstm --version 1
+    python ml/promote_to_production.py --model lstm --rollback
 """
 from __future__ import annotations
 
@@ -23,8 +21,7 @@ load_dotenv(ROOT / ".env")
 from ml.model_registry_service import ModelRegistryService
 
 MODEL_MAP = {
-    "lstm":    "defectsense_lstm_autoencoder",
-    "iforest": "defectsense_isolation_forest",
+    "lstm": "defectsense_lstm_autoencoder_azure",
 }
 
 
@@ -69,7 +66,7 @@ def cmd_list(registry: ModelRegistryService) -> None:
 def cmd_promote(registry: ModelRegistryService, model_alias: str, version: int) -> None:
     model_name = MODEL_MAP.get(model_alias)
     if not model_name:
-        print(f"ERROR: Unknown model alias '{model_alias}'. Use: lstm, iforest")
+        print(f"ERROR: Unknown model alias '{model_alias}'. Use: lstm")
         sys.exit(1)
 
     print(f"Promoting {model_name} v{version} -> champion...")
@@ -85,7 +82,7 @@ def cmd_promote(registry: ModelRegistryService, model_alias: str, version: int) 
 def cmd_rollback(registry: ModelRegistryService, model_alias: str) -> None:
     model_name = MODEL_MAP.get(model_alias)
     if not model_name:
-        print(f"ERROR: Unknown model alias '{model_alias}'. Use: lstm, iforest")
+        print(f"ERROR: Unknown model alias '{model_alias}'. Use: lstm")
         sys.exit(1)
 
     print(f"Rolling back {model_name}...")
@@ -105,13 +102,12 @@ def main() -> None:
         epilog="""
 Examples:
   python ml/promote_to_production.py --list
-  python ml/promote_to_production.py --model lstm    --version 1
-  python ml/promote_to_production.py --model iforest --version 1
-  python ml/promote_to_production.py --model lstm    --rollback
+  python ml/promote_to_production.py --model lstm --version 1
+  python ml/promote_to_production.py --model lstm --rollback
         """,
     )
     parser.add_argument("--list",     action="store_true", help="List all versions")
-    parser.add_argument("--model",    choices=list(MODEL_MAP.keys()), help="Model: lstm or iforest")
+    parser.add_argument("--model",    choices=list(MODEL_MAP.keys()), help="Model: lstm")
     parser.add_argument("--version",  type=int, help="Version number to promote")
     parser.add_argument("--rollback", action="store_true", help="Roll back champion to previous version")
 

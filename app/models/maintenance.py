@@ -10,7 +10,7 @@ class MaintenanceLog(BaseModel):
     date: datetime
     failure_type: str = Field(
         ...,
-        description="TWF | HDF | PWF | OSF | RNF",
+        description="EVF | RSF | PBF | BWF",
     )
     symptoms: str = Field(..., description="Observable symptoms before/during failure")
     root_cause: str = Field(..., description="Identified root cause")
@@ -23,11 +23,11 @@ class MaintenanceLog(BaseModel):
     model_config = {"json_schema_extra": {
         "example": {
             "machine_id": "M042",
-            "date": "2024-03-15T08:30:00",
-            "failure_type": "HDF",
-            "symptoms": "Process temperature exceeded 315K, rotational speed dropped below 1400 RPM",
-            "root_cause": "Cooling fan blade fracture causing heat dissipation failure",
-            "action_taken": "Replaced cooling fan assembly, cleaned heat exchange fins",
+            "date": "2015-03-15T08:30:00",
+            "failure_type": "BWF",
+            "symptoms": "Vibration level 10 units above normal baseline, bearing wear suspected",
+            "root_cause": "Rolling element bearing fatigue causing increased vibration signature",
+            "action_taken": "Replaced worn bearing assembly and verified alignment",
             "resolution_time_hours": 4.5,
             "technician": "J. Smith",
         }

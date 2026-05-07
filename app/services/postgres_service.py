@@ -1,7 +1,7 @@
 """
 PostgreSQL service for DefectSense — Supabase session pooler.
 
-Provides read access to sensor_readings table for ML training
+Provides read access to azure_sensor_readings table for ML training
 and operational stats. Always gracefully degrades — never crashes
 the application if the database is unavailable.
 """
@@ -15,7 +15,7 @@ from loguru import logger
 
 
 class PostgresService:
-    """SQLAlchemy-based PostgreSQL client for sensor_readings table."""
+    """SQLAlchemy-based PostgreSQL client for azure_sensor_readings table."""
 
     def __init__(self, postgres_url: Optional[str]) -> None:
         self._url = postgres_url
@@ -46,9 +46,9 @@ class PostgresService:
             # Log row count if table exists
             try:
                 count = self.get_row_count()
-                logger.info("PostgreSQL: connected ({:,} rows in sensor_readings)", count)
+                logger.info("PostgreSQL: connected ({:,} rows in azure_sensor_readings)", count)
             except Exception:
-                logger.info("PostgreSQL: connected (sensor_readings table not yet created)")
+                logger.info("PostgreSQL: connected (azure_sensor_readings table not yet created)")
 
             self._connected = True
 
@@ -74,13 +74,13 @@ class PostgresService:
     # ── Data Access ────────────────────────────────────────────────────────────
 
     def get_training_data(self, failure_only: bool = False) -> pd.DataFrame:
-        """Pull all rows (or failures only) from sensor_readings."""
+        """Pull all rows (or failures only) from azure_sensor_readings."""
         if not self._connected:
             return pd.DataFrame()
         try:
             from sqlalchemy import text
 
-            query = "SELECT * FROM sensor_readings"
+            query = "SELECT * FROM azure_sensor_readings"
             if failure_only:
                 query += " WHERE machine_failure = 1"
 
@@ -91,7 +91,7 @@ class PostgresService:
             return pd.DataFrame()
 
     def get_normal_samples(self) -> pd.DataFrame:
-        """Return rows where machine_failure = 0."""
+        """Return pre-calculated clean normal rows (is_clean_normal = TRUE)."""
         if not self._connected:
             return pd.DataFrame()
         try:
@@ -99,7 +99,7 @@ class PostgresService:
 
             with self._engine.connect() as conn:
                 return pd.read_sql(
-                    text("SELECT * FROM sensor_readings WHERE machine_failure = 0"),
+                    text("SELECT * FROM azure_sensor_readings WHERE is_clean_normal = TRUE"),
                     conn,
                 )
         except Exception as exc:
@@ -115,7 +115,7 @@ class PostgresService:
 
             with self._engine.connect() as conn:
                 return pd.read_sql(
-                    text("SELECT * FROM sensor_readings WHERE machine_failure = 1"),
+                    text("SELECT * FROM azure_sensor_readings WHERE machine_failure = 1"),
                     conn,
                 )
         except Exception as exc:
@@ -123,7 +123,7 @@ class PostgresService:
             return pd.DataFrame()
 
     def get_machine_stats(self) -> dict:
-        """Return summary statistics over sensor_readings."""
+        """Return summary statistics over azure_sensor_readings."""
         if not self._connected:
             return {}
         try:
@@ -137,29 +137,29 @@ class PostgresService:
                             COUNT(*)                          AS total_rows,
                             SUM(machine_failure)              AS failure_rows,
                             COUNT(*) - SUM(machine_failure)   AS normal_rows
-                        FROM sensor_readings
+                        FROM azure_sensor_readings
                     """),
                     conn,
                 ).iloc[0]
 
-                total = int(totals["total_rows"])
+                total    = int(totals["total_rows"])
                 failures = int(totals["failure_rows"])
-                normal = int(totals["normal_rows"])
+                normal   = int(totals["normal_rows"])
 
-                # By machine type
+                # By machine model
                 by_type_df = pd.read_sql(
                     text("""
-                        SELECT machine_type,
+                        SELECT machine_model,
                                COUNT(*) AS count,
                                SUM(machine_failure) AS failures
-                        FROM sensor_readings
-                        GROUP BY machine_type
+                        FROM azure_sensor_readings
+                        GROUP BY machine_model
                     """),
                     conn,
                 )
                 by_machine_type = {
-                    row["machine_type"]: {
-                        "count": int(row["count"]),
+                    row["machine_model"]: {
+                        "count":    int(row["count"]),
                         "failures": int(row["failures"]),
                     }
                     for _, row in by_type_df.iterrows()
@@ -169,12 +169,11 @@ class PostgresService:
                 means_normal = pd.read_sql(
                     text("""
                         SELECT
-                            AVG(air_temperature)     AS air_temperature,
-                            AVG(process_temperature) AS process_temperature,
-                            AVG(rotational_speed)    AS rotational_speed,
-                            AVG(torque)              AS torque,
-                            AVG(tool_wear)           AS tool_wear
-                        FROM sensor_readings
+                            AVG(volt)      AS volt,
+                            AVG(rotate)    AS rotate,
+                            AVG(pressure)  AS pressure,
+                            AVG(vibration) AS vibration
+                        FROM azure_sensor_readings
                         WHERE machine_failure = 0
                     """),
                     conn,
@@ -184,24 +183,23 @@ class PostgresService:
                 means_failure = pd.read_sql(
                     text("""
                         SELECT
-                            AVG(air_temperature)     AS air_temperature,
-                            AVG(process_temperature) AS process_temperature,
-                            AVG(rotational_speed)    AS rotational_speed,
-                            AVG(torque)              AS torque,
-                            AVG(tool_wear)           AS tool_wear
-                        FROM sensor_readings
+                            AVG(volt)      AS volt,
+                            AVG(rotate)    AS rotate,
+                            AVG(pressure)  AS pressure,
+                            AVG(vibration) AS vibration
+                        FROM azure_sensor_readings
                         WHERE machine_failure = 1
                     """),
                     conn,
                 ).iloc[0].to_dict()
 
             return {
-                "total_rows": total,
-                "failure_rows": failures,
-                "normal_rows": normal,
-                "failure_rate": failures / total if total > 0 else 0.0,
-                "by_machine_type": by_machine_type,
-                "sensor_means_normal": {k: float(v) for k, v in means_normal.items()},
+                "total_rows":           total,
+                "failure_rows":         failures,
+                "normal_rows":          normal,
+                "failure_rate":         failures / total if total > 0 else 0.0,
+                "by_machine_type":      by_machine_type,
+                "sensor_means_normal":  {k: float(v) for k, v in means_normal.items()},
                 "sensor_means_failure": {k: float(v) for k, v in means_failure.items()},
             }
         except Exception as exc:
@@ -209,14 +207,14 @@ class PostgresService:
             return {}
 
     def get_row_count(self) -> int:
-        """Return total row count of sensor_readings, or 0 if unavailable."""
+        """Return total row count of azure_sensor_readings, or 0 if unavailable."""
         if not self._connected or self._engine is None:
             return 0
         try:
             from sqlalchemy import text
 
             with self._engine.connect() as conn:
-                result = conn.execute(text("SELECT COUNT(*) FROM sensor_readings"))
+                result = conn.execute(text("SELECT COUNT(*) FROM azure_sensor_readings"))
                 return int(result.scalar())
         except Exception as exc:
             logger.warning("PostgreSQL get_row_count failed: {}", exc)

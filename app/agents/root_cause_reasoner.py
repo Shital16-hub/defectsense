@@ -42,20 +42,18 @@ if TYPE_CHECKING:
 
 # ── Sensor display names ────────────────────────────────────────────────────────
 SENSOR_LABELS = {
-    "air_temperature":     "air temperature",
-    "process_temperature": "process temperature",
-    "rotational_speed":    "rotational speed",
-    "torque":              "torque",
-    "tool_wear":           "tool wear",
+    "volt":      "voltage",
+    "rotate":    "rotation speed",
+    "pressure":  "pressure",
+    "vibration": "vibration",
 }
 
 # Failure type → plain description for the prompt
 FAILURE_DESCRIPTIONS = {
-    "TWF": "Tool Wear Failure — cutting tool degraded beyond tolerance",
-    "HDF": "Heat Dissipation Failure — cooling system cannot remove heat",
-    "PWF": "Power Failure — electrical or motor power anomaly",
-    "OSF": "Overstrain Failure — mechanical overload on drive train",
-    "RNF": "Random/Unknown Failure — no dominant single cause",
+    "EVF": "Electrical Overload Failure — voltage surge above normal operating range",
+    "RSF": "Rotor Speed Failure — motor cannot maintain target rotation speed",
+    "PBF": "Pressure Blockage Failure — pressure spike indicating blocked line or valve seizure",
+    "BWF": "Bearing Wear Failure — elevated vibration indicating bearing degradation",
 }
 
 AUTO_APPROVE_THRESHOLD = float(os.getenv("AUTO_APPROVE_CONFIDENCE_THRESHOLD", "0.95"))
@@ -551,53 +549,52 @@ async def test_root_cause_agent() -> None:
     print("  RootCauseReasonerAgent — Standalone Test")
     print("=" * 60)
 
-    # ── Mock data ──────────────────────────────────────────────────────────────
+    # ── Mock data (Azure PdM sensors) ─────────────────────────────────────────
     mock_anomaly = AnomalyResult(
-        machine_id="M0042",
+        machine_id="M001",
         timestamp=datetime.now(tz=timezone.utc),
         anomaly_score=0.87,
         failure_probability=0.74,
         is_anomaly=True,
-        failure_type_prediction="HDF",
+        failure_type_prediction="BWF",
         sensor_deltas={
-            "air_temperature":     2.1,
-            "process_temperature": 3.8,
-            "rotational_speed":   -0.4,
-            "torque":              1.2,
-            "tool_wear":           0.9,
+            "volt":      0.3,
+            "rotate":   -0.2,
+            "pressure":  0.1,
+            "vibration": 1.9,
         },
-        ml_model_used="ensemble",
+        ml_model_used="lstm_autoencoder",
     )
 
     mock_incidents = [
         MaintenanceLog(
             machine_id="M026",
-            date=datetime(2024, 1, 15, tzinfo=timezone.utc),
-            failure_type="HDF",
-            symptoms="Thermal alarm triggered, machine auto-shutdown at 320K",
-            root_cause="Cooling system thermostat failed closed",
-            action_taken="Replaced cooling fan assembly, cleaned heat exchange fins",
+            date=datetime(2015, 6, 15, tzinfo=timezone.utc),
+            failure_type="BWF",
+            symptoms="Bearing vibration elevated above normal threshold",
+            root_cause="Rolling element bearing fatigue causing increased vibration signature",
+            action_taken="Replaced worn bearing assembly and verified alignment",
             resolution_time_hours=4.5,
             technician="J. Smith",
         ),
         MaintenanceLog(
             machine_id="M017",
-            date=datetime(2024, 3, 8, tzinfo=timezone.utc),
-            failure_type="HDF",
-            symptoms="Process temperature rising 2 degrees per hour",
-            root_cause="Cooling fan blade fractured, reducing airflow by 60%",
-            action_taken="Emergency fan replacement, 2h shutdown",
+            date=datetime(2015, 9, 8, tzinfo=timezone.utc),
+            failure_type="BWF",
+            symptoms="Progressive vibration increase over 48 hours",
+            root_cause="Insufficient lubrication causing bearing surface wear and vibration",
+            action_taken="Cleaned and relubricated bearing assembly with fresh grease",
             resolution_time_hours=2.0,
             technician="T. Williams",
         ),
     ]
 
     sensor_context = (
-        "Sensor trends over last 10 readings for M0042:\n"
-        "  - Process temperature rose 12.4% (mean: 311.2K, latest: 314.8K)\n"
-        "  - Air temperature rose 4.1% (mean: 299.1K, latest: 301.3K)\n"
-        "  - Rotational speed stable (mean: 1534 RPM)\n"
-        "  - Torque rose 8.2% (mean: 45.1 Nm, latest: 48.8 Nm)"
+        "Sensor trends over last 10 readings for M001 (Azure PdM sensors):\n"
+        "  - Vibration rose 18.3% (mean: 48.2, latest: 56.1)\n"
+        "  - Voltage stable (mean: 174.2 V)\n"
+        "  - Rotation speed stable (mean: 418.5 RPM)\n"
+        "  - Pressure stable (mean: 112.8)"
     )
 
     # ── Try to connect MongoDB for memory (optional) ───────────────────────────
@@ -628,7 +625,7 @@ async def test_root_cause_agent() -> None:
     # ── Build and run agent ────────────────────────────────────────────────────
     agent = RootCauseReasonerAgent(amem=amem_svc, letta=letta_svc)
 
-    print(f"\nAnalyzing: machine={mock_anomaly.machine_id} type={mock_anomaly.failure_type_prediction}")
+    print(f"\nAnalyzing: machine={mock_anomaly.machine_id} type={mock_anomaly.failure_type_prediction} (Azure PdM)")
     print(f"Model: {agent._reasoning_model}\n")
 
     report = await agent.analyze(

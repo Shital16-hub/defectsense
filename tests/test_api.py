@@ -30,7 +30,7 @@ def make_test_app(
     if anomaly_result is None:
         anomaly_result = AnomalyResult(
             machine_id="M001", anomaly_score=0.1, failure_probability=0.1,
-            is_anomaly=False, sensor_deltas={}, ml_model_used="isolation_forest",
+            is_anomaly=False, sensor_deltas={}, ml_model_used="none",
         )
 
     # Mock detector
@@ -102,12 +102,11 @@ def _make_mock_mongo(alerts: list[dict]):
 
 
 VALID_READING = {
-    "machine_id":          "M001",
-    "air_temperature":     298.1,
-    "process_temperature": 308.6,
-    "rotational_speed":    1500.0,
-    "torque":              40.0,
-    "tool_wear":           50.0,
+    "machine_id": "M001",
+    "volt":       176.22,
+    "rotate":     418.50,
+    "pressure":   113.08,
+    "vibration":  45.09,
 }
 
 SAMPLE_ALERT = {
@@ -151,17 +150,17 @@ class TestSensorsAPI:
         r      = client.post("/api/sensors/ingest", json=bad)
         assert r.status_code == 422
 
-    def test_ingest_invalid_temperature_returns_422(self):
+    def test_ingest_negative_volt_returns_422(self):
         app    = make_test_app()
         client = TestClient(app, raise_server_exceptions=False)
-        bad    = {**VALID_READING, "air_temperature": -5.0}
+        bad    = {**VALID_READING, "volt": -5.0}
         r      = client.post("/api/sensors/ingest", json=bad)
         assert r.status_code == 422
 
-    def test_ingest_negative_tool_wear_returns_422(self):
+    def test_ingest_negative_vibration_returns_422(self):
         app    = make_test_app()
         client = TestClient(app, raise_server_exceptions=False)
-        bad    = {**VALID_READING, "tool_wear": -1.0}
+        bad    = {**VALID_READING, "vibration": -1.0}
         r      = client.post("/api/sensors/ingest", json=bad)
         assert r.status_code == 422
 

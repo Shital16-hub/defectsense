@@ -9,14 +9,30 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Query, Request
+from pydantic import BaseModel
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 router = APIRouter()
 
 COLL_EVAL  = "evaluation_results"
 COLL_DRIFT = "drift_reports"
+
+_TRAINING_SCRIPTS = [
+    "ml/train_autoencoder_azure.py",
+]
+
+
+class RetrainRequest(BaseModel):
+    """Optional request body for the manual retrain endpoint."""
+    reason: str = "manual trigger"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -90,6 +106,41 @@ async def trigger_evaluation(request: Request):
         "status":  "started",
         "message": "Evaluation started in background — check /api/evaluation/latest in ~2 minutes",
     }
+
+
+@router.post("/retrain")
+async def trigger_retrain(
+    request: Request,
+    body: RetrainRequest = RetrainRequest(),
+):
+    """
+    Manually trigger ML model retraining as fire-and-forget background subprocesses.
+
+    Launches train_autoencoder_azure.py without waiting for completion.
+    Always returns immediately. Never raises an HTTP exception — failures
+    are returned as JSON with status 'failed'.
+    """
+    try:
+        for script in _TRAINING_SCRIPTS:
+            subprocess.Popen(
+                [sys.executable, script],
+                cwd=str(_PROJECT_ROOT),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return {
+            "status":    "started",
+            "message":   "Retraining jobs submitted as background processes",
+            "reason":    body.reason,
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        }
+    except Exception as exc:
+        return {
+            "status":  "failed",
+            "error":   str(exc),
+            "reason":  body.reason,
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        }
 
 
 # ── Drift monitoring endpoints ─────────────────────────────────────────────────

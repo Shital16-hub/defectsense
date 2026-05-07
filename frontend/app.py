@@ -376,11 +376,11 @@ def load_health():
     )
 
     ml_md = (
-        "**Models:** LSTM Autoencoder + Isolation Forest\n\n"
-        "**Sequence length:** 30 readings\n\n"
-        "**Detection:** High-conf = LSTM above threshold AND IForest = -1\n\n"
-        "**Failure types:** TWF · HDF · PWF · OSF · RNF\n\n"
-        "**Dataset:** AI4I 2020 — 10,000 rows · 339 failure rows (3.4%)"
+        "**Models:** LSTM Autoencoder\n\n"
+        "**Sequence length:** 198 readings\n\n"
+        "**Detection:** LSTM reconstruction error > anomaly threshold\n\n"
+        "**Failure types:** EVF · RSF · PBF · BWF\n\n"
+        "**Dataset:** Azure PdM — 876,100 rows · 100 machines · 1 year"
     )
 
     return svc_md, stats_md, ml_md
@@ -415,20 +415,38 @@ def run_evaluation_now() -> str:
     return "✓ Evaluation started — refresh in ~2 minutes"
 
 
+def run_retrain_now() -> str:
+    """Call POST /api/evaluation/retrain and return a status string."""
+    resp = _post("/api/evaluation/retrain", {"reason": "manual trigger from dashboard"})
+    if resp.get("status") == "started":
+        return f"✓ {resp.get('message', 'Retraining jobs submitted')}"
+    return f"Error: {resp.get('error', 'Unknown error')}"
+
+
 def load_evaluation_results():
     """Return (status_text, scores_html, history_rows, sample_rows)."""
     latest  = _get("/api/evaluation/latest")
     history = _get("/api/evaluation/history", {"limit": 20})
 
     # ── Status text ──────────────────────────────────────────────────────────
-    rag_doc = latest.get("rag")   if isinstance(latest, dict) else None
-    llm_doc = latest.get("llm_judge") if isinstance(latest, dict) else None
+    rag_doc = latest.get("rag")        if isinstance(latest, dict) else None
+    llm_doc = latest.get("llm_judge")  if isinstance(latest, dict) else None
 
     if rag_doc:
         run_at   = rag_doc.get("run_at", "")[:19].replace("T", " ")
         status_t = f"Last evaluation: {run_at} UTC"
     else:
         status_t = "No evaluation results yet — click 'Run Evaluation Now'"
+
+    # Append latest drift report info
+    drift = _get("/api/evaluation/drift/latest")
+    if isinstance(drift, dict) and "run_at" in drift:
+        drift_at  = drift.get("run_at", "")[:19].replace("T", " ")
+        is_drifted = drift.get("is_drifted")
+        retrain    = drift.get("retraining_triggered")
+        drift_lbl  = "DRIFT DETECTED" if is_drifted else "OK"
+        retrain_lbl = "triggered" if retrain else "not triggered"
+        status_t += f" | Last drift: {drift_at} UTC [{drift_lbl}] | Retraining: {retrain_lbl}"
 
     # ── Score cards HTML ─────────────────────────────────────────────────────
     cards = []
@@ -683,9 +701,11 @@ def build_app() -> gr.Blocks:
                 )
 
                 with gr.Row():
-                    t6_run_btn     = gr.Button("Run Evaluation Now", variant="primary", scale=1)
-                    t6_refresh_btn = gr.Button("Refresh Results",    variant="secondary", scale=1)
-                    t6_status      = gr.Textbox(label="Status", interactive=False, scale=3)
+                    t6_run_btn      = gr.Button("Run Evaluation Now",  variant="primary",   scale=1)
+                    t6_retrain_btn  = gr.Button("Retrain Models Now",  variant="stop",      scale=1)
+                    t6_refresh_btn  = gr.Button("Refresh Results",     variant="secondary", scale=1)
+                    t6_status       = gr.Textbox(label="Evaluation Status", interactive=False, scale=2)
+                    t6_retrain_status = gr.Textbox(label="Retraining Status", interactive=False, scale=2)
 
                 t6_scores_html = gr.HTML(value="<i>Loading…</i>")
 
@@ -711,8 +731,9 @@ def build_app() -> gr.Blocks:
                     msg = run_evaluation_now()
                     return (msg,) + tuple(load_evaluation_results()[1:])
 
-                t6_run_btn.click(fn=_run_and_refresh,     outputs=_t6_outputs)
-                t6_refresh_btn.click(fn=refresh_evaluation, outputs=_t6_outputs)
+                t6_run_btn.click(fn=_run_and_refresh,        outputs=_t6_outputs)
+                t6_retrain_btn.click(fn=run_retrain_now,     outputs=t6_retrain_status)
+                t6_refresh_btn.click(fn=refresh_evaluation,  outputs=_t6_outputs)
 
         demo.load(fn=load_health, outputs=[svc_md, stats_md, ml_md])
         demo.load(fn=refresh_recent_logs, outputs=t5_recent_tbl)

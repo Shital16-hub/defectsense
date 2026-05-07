@@ -93,7 +93,7 @@ def make_test_app(
     app.state.redis         = MagicMock(is_connected=True, get_history=AsyncMock(return_value=[]))
     app.state.detector      = MagicMock(run=AsyncMock(return_value=MagicMock(
         is_anomaly=False, anomaly_score=0.1, failure_probability=0.1,
-        sensor_deltas={}, ml_model_used="isolation_forest",
+        sensor_deltas={}, ml_model_used="none",
     )))
     app.state.orchestrator  = MagicMock(run=AsyncMock(return_value={"is_anomaly": False, "alert": None}))
     app.state.ws_manager    = MagicMock(broadcast=AsyncMock(return_value=None))

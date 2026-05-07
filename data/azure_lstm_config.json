@@ -1,0 +1,12 @@
+{
+  "sequence_length": 198,
+  "calculated_from": "azure_pdm",
+  "total_failure_events": 761,
+  "median_precursor_hours": 198.0,
+  "mean_precursor_hours": 191.17345597897503,
+  "min_precursor_hours": 19,
+  "max_precursor_hours": 199,
+  "z_threshold_used": 1.5,
+  "lookback_hrs_used": 200,
+  "calculation_date": "2026-04-14T09:23:10.454551+00:00"
+}

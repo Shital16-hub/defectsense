@@ -2,7 +2,7 @@
 DefectSense — FastAPI application entry point.
 
 Startup sequence:
-  1. Load ML models (LSTM Autoencoder + Isolation Forest)
+  1. Load ML models (LSTM Autoencoder)
   2. Connect to Redis
   3. Connect to MongoDB (optional — degrades gracefully if unavailable)
   4. Connect to Qdrant + load embedding model (optional)
@@ -111,9 +111,10 @@ async def run_drift_check(app: FastAPI) -> None:
         if drift_svc and redis_svc:
             result = await drift_svc.run_full_drift_check(redis_svc)
             logger.info(
-                "Drift check complete: is_drifted={} share={:.0%}",
+                "Drift check complete: is_drifted={} share={:.0%} retraining_triggered={}",
                 result.get("is_drifted"),
                 result.get("drift_share", 0),
+                result.get("retraining_triggered", False),
             )
     except Exception as exc:
         logger.warning("Drift check failed (non-fatal): {}", exc)
@@ -128,12 +129,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("  DefectSense — starting up")
     logger.info("=" * 60)
 
-    # ── Azure Blob Storage Service ─────────────────────────────────────────────
+    # ── Blob Storage Service (stub — models stored locally in ml/models/) ─────
     from app.services.blob_storage_service import BlobStorageService
-    blob_service = BlobStorageService(
-        connection_string=os.getenv("AZURE_STORAGE_CONNECTION_STRING"),
-        container_name=os.getenv("AZURE_STORAGE_CONTAINER", "defectsense-models"),
-    )
+    blob_service = BlobStorageService()
     app.state.blob_storage = blob_service
 
     # ── ML Service ─────────────────────────────────────────────────────────────
@@ -156,7 +154,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.postgres = postgres_service
     if postgres_service.is_connected:
         row_count = postgres_service.get_row_count()
-        logger.info("PostgreSQL: connected ({:,} rows)", row_count)
+        logger.info("PostgreSQL: connected ({:,} rows in azure_sensor_readings)", row_count)
     else:
         logger.warning("PostgreSQL: unavailable (degraded)")
 

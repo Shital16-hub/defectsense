@@ -36,61 +36,36 @@ pytestmark = []  # per-test markers applied below where needed
 class TestBlobStorageMocked:
     def test_blob_service_upload_download_cycle(self, tmp_path):
         """
-        Upload a file → list blobs → download → verify content.
-        Uses a fully mocked BlobServiceClient so no Azure credentials needed.
+        BlobStorageService is now a stub — all operations are no-ops.
+        upload/download return False, list returns [], is_available is False.
         """
         from app.services.blob_storage_service import BlobStorageService
 
-        blob_name   = "isolation_forest_latest.pkl"
+        blob_name    = "azure_sensor_scaler_latest.pkl"
         file_content = b"mock-model-bytes-for-testing"
 
-        # Write local file to upload
-        local_file = tmp_path / "isolation_forest.pkl"
+        local_file = tmp_path / "azure_sensor_scaler.pkl"
         local_file.write_bytes(file_content)
 
-        # ── Mock the Azure SDK ─────────────────────────────────────────────────
-        mock_blob_client = MagicMock()
-        mock_container_client = MagicMock()
-        mock_service_client = MagicMock()
+        svc = BlobStorageService(
+            connection_string="DefaultEndpointsProtocol=https;AccountName=test",
+            container_name="defectsense-models",
+        )
 
-        # list_blobs returns one blob with the expected name
-        mock_blob_item      = MagicMock()
-        mock_blob_item.name = blob_name
-        mock_container_client.list_blobs.return_value = [mock_blob_item]
+        assert svc.is_available is False
 
-        # download_blob returns the original bytes
-        mock_download = MagicMock()
-        mock_download.readall.return_value = file_content
-        mock_blob_client.download_blob.return_value = mock_download
-        mock_container_client.get_blob_client.return_value = mock_blob_client
-
-        mock_service_client.get_container_client.return_value = mock_container_client
-
-        with patch(
-            "app.services.blob_storage_service.BlobServiceClient.from_connection_string",
-            return_value=mock_service_client,
-        ):
-            svc = BlobStorageService(
-                connection_string="DefaultEndpointsProtocol=https;AccountName=test",
-                container_name="defectsense-models",
-            )
-
-        assert svc.is_available is True
-
-        # Upload
+        # Upload is a no-op
         ok = svc.upload_model(local_file, blob_name)
-        assert ok is True
-        mock_container_client.upload_blob.assert_called_once()
+        assert ok is False
 
-        # List
-        blobs = svc.list_models()
-        assert blob_name in blobs
+        # List returns empty
+        assert svc.list_models() == []
 
-        # Download
+        # Download is a no-op
         download_dest = tmp_path / "downloaded_model.pkl"
         ok = svc.download_model(blob_name, download_dest)
-        assert ok is True
-        assert download_dest.read_bytes() == file_content
+        assert ok is False
+        assert not download_dest.exists()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -129,24 +104,28 @@ class TestMLServiceBlobIntegration:
         touching blob storage.
         """
         from app.services.ml_service import MLService
+        from unittest.mock import mock_open
 
         mock_blob_svc = MagicMock()
         mock_blob_svc.is_available = True
 
         svc = MLService(blob_service=mock_blob_svc)
 
-        with patch("pathlib.Path.exists", return_value=True), \
-             patch("builtins.open", MagicMock()), \
-             patch("pickle.load", return_value={
-                 "model": MagicMock(),
-                 "scaler": MagicMock(),
-                 "features": ["air_temperature", "process_temperature",
-                               "rotational_speed", "torque", "tool_wear"],
-             }):
-            try:
-                svc._load_isolation_forest()
-            except Exception:
-                pass  # partial load is fine for this test
+        fake_scaler = MagicMock()
+        fake_threshold = {"threshold": 0.01, "mean": 0.005, "std": 0.001}
+
+        with patch("app.services.ml_service.AUTOENCODER_PATH") as mp_ae, \
+             patch("app.services.ml_service.SCALER_PATH") as mp_sc, \
+             patch("app.services.ml_service.THRESHOLD_PATH") as mp_th, \
+             patch("app.services.ml_service.MLService._init_mlflow", return_value=None), \
+             patch("tensorflow.keras.models.load_model", return_value=MagicMock()), \
+             patch("pickle.load", side_effect=[fake_scaler, fake_threshold]), \
+             patch("builtins.open", mock_open()):
+            mp_ae.exists.return_value = True
+            mp_sc.exists.return_value = True
+            mp_th.exists.return_value = True
+            mp_ae.__str__ = lambda self: "/fake/azure_lstm_autoencoder.keras"
+            svc.load()
 
         # Blob download should NOT have been called
         mock_blob_svc.download_model.assert_not_called()
@@ -362,10 +341,10 @@ class TestModelRegistryLifecycle:
 
         # ── Promote v1 to champion ─────────────────────────────────────────────
         client.get_model_version_by_alias.side_effect = Exception("no alias yet")
-        result = svc.promote_to_production("defectsense_isolation_forest", version=1)
+        result = svc.promote_to_production("defectsense_lstm_autoencoder", version=1)
         assert result is True
         client.set_registered_model_alias.assert_called_with(
-            name="defectsense_isolation_forest",
+            name="defectsense_lstm_autoencoder",
             alias="champion",
             version="1",
         )
@@ -373,12 +352,12 @@ class TestModelRegistryLifecycle:
         # ── Rollback (v1 is already v1, so False) ─────────────────────────────
         client.get_model_version_by_alias.side_effect = None
         client.get_model_version_by_alias.return_value = v1
-        rb = svc.rollback("defectsense_isolation_forest")
+        rb = svc.rollback("defectsense_lstm_autoencoder")
         assert rb is False   # can't roll back from v1
 
         # ── Compare v1 vs v2 ──────────────────────────────────────────────────
         client.search_model_versions.side_effect = [[v1], [v2]]
-        cmp = svc.compare_versions("defectsense_isolation_forest", 1, 2)
+        cmp = svc.compare_versions("defectsense_lstm_autoencoder", 1, 2)
         assert cmp.get("better_version") == 2
 
 
@@ -619,12 +598,11 @@ class TestGracefulDegradation:
             # POST /api/sensors/ingest must return 200 (or 202/422 for bad input)
             # with a valid reading body
             reading_payload = {
-                "machine_id":          "M001",
-                "air_temperature":     298.1,
-                "process_temperature": 308.6,
-                "rotational_speed":    1500.0,
-                "torque":              40.0,
-                "tool_wear":           50.0,
+                "machine_id": "M001",
+                "volt":       176.22,
+                "rotate":     418.50,
+                "pressure":   113.08,
+                "vibration":  45.09,
             }
             ingest_resp = client.post(
                 "/api/sensors/ingest",

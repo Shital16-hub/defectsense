@@ -7,7 +7,7 @@
 [![LangGraph](https://img.shields.io/badge/LangGraph-1.1-orange)](https://langchain-ai.github.io/langgraph)
 [![Groq](https://img.shields.io/badge/LLM-Groq_llama3-purple)](https://groq.com)
 [![TensorFlow](https://img.shields.io/badge/TensorFlow-2.21-FF6F00)](https://tensorflow.org)
-[![Tests](https://img.shields.io/badge/tests-182_passed-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)](#testing)
 
 Manufacturing plants lose **$260 billion per year** to unplanned downtime (Deloitte, 2024).
 Existing condition-monitoring systems tell you *when* a machine failed — not *why*.
@@ -19,20 +19,20 @@ maintenance actions, and an explanation a factory-floor engineer can actually ac
 ## What This System Does
 
 DefectSense is a real-time anomaly detection and root-cause reasoning platform built
-for manufacturing environments. It continuously ingests sensor readings from CNC machines
-— air temperature, process temperature, rotational speed, torque, and tool wear — and
-runs them through a hybrid ML pipeline that combines an LSTM Autoencoder for temporal
-pattern detection with an Isolation Forest for single-point outlier detection. When
-both models agree an anomaly is occurring, a LangGraph multi-agent pipeline activates:
-a retrieval agent pulls relevant maintenance records from a vector store, a ReAct reasoning
-agent synthesises those records with the sensor data and machine history to produce a
-structured root-cause report, and an alert generator formats that into plain language
-a maintenance engineer can act on immediately. Every incident is stored in an agentic
-memory system that improves future diagnoses, and every alert waits for human approval
-before being actioned — or auto-approves after 15 minutes if the operator is unavailable.
-Unlike rule-based threshold systems that generate constant false positives, DefectSense
-learns the specific failure patterns of each machine and explains them, cutting mean
-time to repair while keeping human judgment in the loop for critical decisions.
+for manufacturing environments. It continuously ingests sensor readings from industrial
+machines — voltage, rotational speed, pressure, and vibration — and runs them through
+an LSTM Autoencoder that learns normal operating sequences and flags deviations via
+reconstruction error. When an anomaly is detected, a LangGraph multi-agent pipeline
+activates: a retrieval agent pulls relevant maintenance records from a vector store,
+a ReAct reasoning agent synthesises those records with the sensor data and machine
+history to produce a structured root-cause report, and an alert generator formats that
+into plain language a maintenance engineer can act on immediately. Every incident is
+stored in an agentic memory system that improves future diagnoses, and every alert
+waits for human approval before being actioned — or auto-approves after 15 minutes if
+the operator is unavailable. Unlike rule-based threshold systems that generate constant
+false positives, DefectSense learns the specific failure patterns of each machine and
+explains them, cutting mean time to repair while keeping human judgment in the loop
+for critical decisions.
 
 ---
 
@@ -40,9 +40,9 @@ time to repair while keeping human judgment in the loop for critical decisions.
 
 ```mermaid
 graph TD
-    A[Sensor Stream<br/>AI4I 2020 / Live Data] -->|POST /api/sensors/ingest| B[FastAPI :8080]
+    A[Sensor Stream<br/>Azure PdM / Live Data] -->|POST /api/sensors/ingest| B[FastAPI :8080]
     B --> C[AnomalyDetectorAgent]
-    C -->|LSTM + IForest ensemble| D{Anomaly?}
+    C -->|LSTM Autoencoder| D{Anomaly?}
     D -->|No| E[Redis cache only]
     D -->|Yes| F[LangGraph Orchestrator]
 
@@ -88,13 +88,13 @@ graph TD
 
 ## Key Features
 
-**1. Hybrid ML Anomaly Detection**
-Two models run in parallel on every sensor reading. The LSTM Autoencoder learns normal
-operating sequences over a 30-reading window and flags gradual drift — the kind of slow
-degradation that kills machines over days. The Isolation Forest catches single-point
-outliers — sudden temperature spikes or torque surges. High-confidence alerts require
-both to agree; low-confidence alerts fire when either detects something unusual. This
-ensemble approach eliminates the false-positive flood that plagues single-model systems.
+**1. LSTM Autoencoder Anomaly Detection**
+The LSTM Autoencoder learns normal operating sequences over a 198-reading window and
+flags gradual drift — the kind of slow degradation that kills machines over days.
+Reconstruction error (MSE) is compared against a statistical threshold (mean + 3 std
+over validation normal sequences). When reconstruction error exceeds threshold the
+reading is classified as anomalous. Trained on 876,100 Azure PdM sensor readings
+across 100 machines, the model achieves AUC 0.846 on real pre-failure sequences.
 
 **2. ReAct Root Cause Reasoning**
 When an anomaly is detected, a LangGraph agent running Groq's `llama-3.3-70b-versatile`
@@ -156,26 +156,20 @@ running `MLService` loads.
 
 ## ML Model Performance
 
-Evaluated on the AI4I 2020 dataset — **2,000-row held-out test set** (last 20% of 10,000
-rows), containing 39 failure events (1.9% failure rate).
+Evaluated on the **Azure PdM dataset** — 100 machines, 1 year of hourly readings,
+761 failure events across 4 component failure types.
 
-| Model | Precision | Recall | F1 | AUC |
-|---|---|---|---|---|
-| Isolation Forest | 0.196 | 0.231 | 0.212 | **0.929** |
-| LSTM Autoencoder | 0.000 | 0.000 | 0.000 | 0.455 |
-| **Ensemble** | **0.200** | **0.237** | **0.217** | **0.905** |
+| Model | AUC | Detection Rate |
+|---|---|---|
+| **LSTM Autoencoder** | **0.846** | **67%** |
 
-**Why AUC, not precision/recall?**
+**Why AUC?**
 AUC (Area Under the ROC Curve) measures ranking quality — how reliably the model assigns
-higher anomaly scores to actual failures than to normal readings. An AUC of **0.929**
-means the Isolation Forest correctly ranks 93 out of 100 randomly drawn failure/normal
-pairs, regardless of threshold. On a dataset where only 1.9% of readings are failures,
-precision and recall are dominated by the threshold choice, not model quality. A lower
-threshold would boost recall dramatically (catching more failures earlier) at the cost
-of more false alarms — that trade-off is an operational decision, not a model limitation.
-The LSTM Autoencoder's low AUC reflects training on mixed data (including failure
-sequences), which degrades reconstruction-error reliability in isolation; it contributes
-meaningfully to ensemble confidence scoring without driving the primary detection signal.
+higher reconstruction error to pre-failure sequences than to clean normal sequences.
+An AUC of **0.846** means the model correctly ranks 85 out of 100 randomly drawn
+failure/normal sequence pairs. The sequence length of 198 readings was computed
+automatically from the median inter-failure interval across 761 failure events,
+ensuring the model sees the most informative time window before each failure.
 
 ---
 
@@ -186,17 +180,17 @@ meaningfully to ensemble confidence scoring without driving the primary detectio
 | **API** | FastAPI 0.135, Pydantic v2, Uvicorn |
 | **Orchestration** | LangGraph 1.1 (HITL state machine) |
 | **LLM** | Groq API — llama-3.3-70b (reasoning) + llama-3.1-8b (alerts) |
-| **ML** | TensorFlow 2.21 (LSTM Autoencoder) + scikit-learn (Isolation Forest) |
+| **ML** | TensorFlow 2.21 (LSTM Autoencoder) |
 | **RAG** | Qdrant Cloud (vector store) + sentence-transformers/all-MiniLM-L6-v2 |
 | **Agent Memory** | A-MEM custom (Zettelkasten, MongoDB) + Letta (MemGPT-style) |
 | **Databases** | MongoDB Atlas (motor async) · Redis/Upstash (pub/sub + cache) |
-| **Cloud Storage** | Azure Blob Storage (versioned model artefacts) |
+| **Model Storage** | Local — `ml/models/` directory (generated by training script) |
 | **Training DB** | PostgreSQL via Supabase (SQLAlchemy, SSL) |
 | **Drift Monitor** | Evidently AI (DataDriftPreset, nightly APScheduler) |
 | **Model Registry** | MLflow 3.x (SQLite backend, challenger/champion aliases) |
 | **Frontend** | Gradio 6.9, Plotly 6.6 |
 | **Observability** | MLflow (live prediction tracking) · LangSmith (LLM traces) |
-| **Dataset** | AI4I 2020 Predictive Maintenance (10,000 rows, 5 failure types) |
+| **Dataset** | Azure PdM (876,100 rows, 100 machines, 4 failure components) |
 
 ---
 
@@ -214,8 +208,9 @@ meaningfully to ensemble confidence scoring without driving the primary detectio
   - `MONGODB_URL` — [mongodb.com/atlas](https://mongodb.com/atlas) (free tier works)
   - `REDIS_URL` — [upstash.com](https://upstash.com) or local Redis
   - `POSTGRES_URL` — [supabase.com](https://supabase.com) (free tier: 500 MB)
-  - `AZURE_STORAGE_CONNECTION_STRING` — Azure Portal → Storage Account → Access Keys
-  - `AZURE_STORAGE_CONTAINER` — container name (must exist before training)
+
+> **No cloud storage credentials needed.** Models are stored locally in `ml/models/`
+> and generated by running the training script.
 
 ### Step 1 — Clone and install
 
@@ -234,7 +229,7 @@ cp .env.example .env
 # Open .env and fill in your API keys
 ```
 
-Key variables to set (full list in `.env.example`):
+Key variables to set:
 
 ```env
 # LLM
@@ -246,56 +241,48 @@ QDRANT_API_KEY=...
 MONGODB_URL=mongodb+srv://user:pass@cluster.mongodb.net
 REDIS_URL=rediss://...upstash.io:6380
 
-# Cloud infrastructure
+# Training data
 POSTGRES_URL=postgresql://postgres.xxx:password@aws-0-region.pooler.supabase.com:6543/postgres
-AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=...
-AZURE_STORAGE_CONTAINER=defectsense-models
 
-# MLflow
+# MLflow (local SQLite — no server needed)
 MLFLOW_TRACKING_URI=sqlite:///mlruns/mlflow.db
 ```
 
 ### Step 3 — Load training data
 
 ```bash
-python data/download_data.py           # download AI4I 2020 CSV
-python data/load_to_postgres.py        # load 10,000 rows into PostgreSQL
+python data/load_azure_to_postgres.py  # load 876,100 Azure PdM rows into PostgreSQL
 ```
 
-### Step 4 — Train models
+### Step 4 — Train model
 
-Both scripts automatically: train the model → evaluate on held-out test set →
-log metrics to MLflow → save locally → upload to Azure Blob → register in MLflow
+The script automatically: trains → evaluates on pre-failure sequences →
+logs metrics to MLflow → saves locally to `ml/models/` → registers in MLflow
 as `challenger`.
 
 ```bash
-python ml/train_autoencoder.py
-python ml/train_isolation_forest.py
+python ml/train_autoencoder_azure.py
 ```
 
-Expected output (Isolation Forest):
+Expected output:
 
 ```
-Registry:  defectsense_isolation_forest v1
+Registry:  defectsense_lstm_autoencoder v1
 Alias:     challenger
-AUC:       0.9289
-Precision: 0.1963
-Recall:    0.2308
-F1:        0.2121
+AUC:       0.8460
 ```
 
-### Step 5 — Promote models to production
+### Step 5 — Promote model to production
 
 ```bash
 # See all registered versions with AUC scores
 python ml/promote_to_production.py --list
 
-# Promote both models to champion
-python ml/promote_to_production.py --model lstm    --version 1
-python ml/promote_to_production.py --model iforest --version 1
+# Promote to champion
+python ml/promote_to_production.py --model lstm --version 1
 
 # Roll back if needed
-python ml/promote_to_production.py --model iforest --rollback
+python ml/promote_to_production.py --model lstm --rollback
 ```
 
 ### Step 6 — Index RAG knowledge base
@@ -336,7 +323,7 @@ traces + alerts) · **Model Registry** (challenger/champion versions) · **Evalu
 defectsense/
 ├── app/
 │   ├── agents/
-│   │   ├── anomaly_detector.py       # LSTM + IForest ensemble agent
+│   │   ├── anomaly_detector.py       # LSTM Autoencoder anomaly agent
 │   │   ├── context_retriever.py      # Qdrant RAG agent
 │   │   ├── root_cause_reasoner.py    # ReAct reasoning agent (llama-3.3-70b)
 │   │   ├── alert_generator.py        # Alert formatting agent (llama-3.1-8b)
@@ -364,13 +351,12 @@ defectsense/
 │   ├── models/                       # trained artefacts (gitignored)
 │   ├── model_registry_service.py     # MLflow 3.x aliases API wrapper
 │   ├── promote_to_production.py      # CLI: list / promote / rollback
-│   ├── train_autoencoder.py
-│   └── train_isolation_forest.py
+│   └── train_autoencoder_azure.py
 ├── frontend/app.py                   # Gradio 4-tab dashboard
 ├── data/
-│   ├── ai4i_2020.csv                 # AI4I 2020 dataset
-│   ├── download_data.py
-│   ├── load_to_postgres.py           # CSV → PostgreSQL loader
+│   ├── azure_pdm/                    # Azure PdM dataset CSVs (876,100 rows)
+│   ├── azure_lstm_config.json        # sequence_length=198 (auto-computed)
+│   ├── load_azure_to_postgres.py     # Azure PdM → PostgreSQL loader
 │   ├── feature_queries.sql           # SQL window functions for features
 │   ├── generate_logs.py
 │   ├── index_maintenance_logs.py
@@ -387,29 +373,28 @@ defectsense/
 
 This is the section interviewers most often ask about. Here is how each layer works.
 
-### Model Artifact Storage — Azure Blob Storage
+### Model Artifact Storage — Local (`ml/models/`)
 
-Every time a model is trained, the script calls `BlobStorageService.upload_model()` twice
-— once as `*_latest.pkl` (always the current version) and once as `*_YYYYMMDD.pkl`
-(date-stamped for rollback). On `MLService.load()`, if the local `.pkl` file does not
-exist, the service automatically downloads from blob before attempting to load. This
-enables clean deployments: clone the repo, set environment variables, start the server —
-the correct model arrives via blob without any manual intervention. The service degrades
-gracefully if `AZURE_STORAGE_CONNECTION_STRING` is not set, falling back to local files
-only; the app still starts and the `/health` endpoint reports `blob_storage_ready: false`
-so the degraded state is immediately visible.
+Models are stored locally in `ml/models/` and generated by running
+`ml/train_autoencoder_azure.py`. The `BlobStorageService` class is kept as an
+interface-compatible stub (always returns `is_available=False`) so the rest of the
+codebase — health checks, `MLService`, tests — continues to work without modification.
+The stub logs a clear info message on startup and returns False for all operations.
+
+To restore cloud storage in future, replace the stub implementation in
+`app/services/blob_storage_service.py` with Azure Blob Storage, AWS S3, or
+Hugging Face Hub — no other files need to change because the interface is unchanged.
 
 ### Training Data — PostgreSQL on Supabase
 
-The AI4I 2020 dataset's 10,000 sensor readings are stored in a Supabase PostgreSQL
-instance. Both training scripts call `PostgresService.get_normal_samples()` and
-`get_failure_samples()` via SQLAlchemy with `sslmode=require` for the Supabase session
-pooler. `feature_queries.sql` contains window functions for rolling averages and
-lag features — the kind of SQL feature engineering that scales to millions of rows
-without loading everything into Python memory. If PostgreSQL is unavailable (network
-issue, quota exceeded), both scripts fall back to the local CSV automatically, so
-training is never blocked by database outages. The `is_connected` property and graceful
-`init()` pattern mean the app starts cleanly even without a database connection.
+The Azure PdM dataset's 876,100 sensor readings are stored in a Supabase PostgreSQL
+instance in the `azure_sensor_readings` table. The training script queries
+clean normal rows (`is_clean_normal = TRUE`) for LSTM training, and failure-adjacent
+rows for threshold calibration and AUC computation. SQLAlchemy with `sslmode=require`
+is used for the Supabase session pooler. If PostgreSQL is unavailable (network issue,
+quota exceeded), the training script exits early with a clear error — training data
+is too large to bundle as a CSV fallback. The `is_connected` property and graceful
+`init()` pattern mean the app itself starts cleanly even without a database connection.
 
 ### Drift Monitoring — Evidently AI
 
@@ -417,22 +402,22 @@ An APScheduler cron job fires at 03:00 UTC every night. It discovers active mach
 from Redis key patterns (`sensor:*:readings`), fetches the last 100 readings per machine,
 and runs Evidently's `DataDriftPreset` — comparing the live distribution against the
 PostgreSQL reference distribution of normal samples. Evidently computes a KS-test
-p-value per feature; if more than 50% of the five sensor features drift (p < 0.05),
-`is_drifted` is set to `True` and the report is saved to MongoDB's `drift_reports`
-collection. The operations team can query `/api/evaluation/drift/latest` or `/drift/history`
-to track distribution health over time. When drift is detected, the natural next step
-is to retrain with the new distribution as reference — the training scripts are already
-wired to do this from PostgreSQL.
+p-value per feature; if more than 50% of the four sensor features (volt, rotate,
+pressure, vibration) drift (p < 0.05), `is_drifted` is set to `True` and the report
+is saved to MongoDB's `drift_reports` collection. The operations team can query
+`/api/evaluation/drift/latest` or `/drift/history` to track distribution health over
+time. When drift is detected, `train_autoencoder_azure.py` is launched automatically
+as a background subprocess to retrain with the new distribution.
 
 ### Model Registry — MLflow (Challenger/Champion)
 
 Models follow a two-stage lifecycle using MLflow 3.x aliases: a freshly trained model
 receives the `challenger` alias automatically at the end of the training script. After
-manual review of the AUC and precision/recall trade-off (visible in `--list`), the
-operator runs `promote_to_production.py --model iforest --version N` to move the
-`champion` alias. The previous champion has its alias removed first, so there is always
-at most one champion per model. Rollback is equally simple: `--rollback` moves `champion`
-to `current_version - 1` after verifying that version still exists in the registry.
+manual review of the AUC score (visible in `--list`), the operator runs
+`promote_to_production.py --model lstm --version N` to move the `champion` alias.
+The previous champion has its alias removed first, so there is always at most one
+champion per model. Rollback is equally simple: `--rollback` moves `champion` to
+`current_version - 1` after verifying that version still exists in the registry.
 One subtle implementation detail: `search_model_versions()` does not populate `mv.aliases`
 with the SQLite backend — the service builds an explicit alias map via
 `get_model_version_by_alias()` for each known alias to work around this.
@@ -446,11 +431,14 @@ Groq's llama-3.3-70b delivers sub-2-second reasoning responses on manufacturing 
 prompts. For a real-time monitoring system where a factory-floor engineer needs an answer
 now, not in 15 seconds, inference latency is a product requirement, not a nice-to-have.
 
-**Why LSTM + Isolation Forest ensemble instead of one model?**
-Isolation Forest detects single-point outliers well (sudden sensor spike) but misses
-gradual drift. LSTM catches temporal patterns across a 30-reading window but requires
-history to be meaningful. The ensemble covers both failure modes: IForest provides
-immediate detection, LSTM improves confidence when history is available.
+**Why LSTM Autoencoder for anomaly detection?**
+LSTM captures temporal dependencies across a 198-reading window — exactly the right
+inductive bias for machine failures that develop over hours, not instants. Reconstruction
+error is a natural anomaly score: the model learns to reconstruct normal operating
+patterns and fails to reconstruct anomalous ones. The sequence length was derived
+automatically from the Azure PdM failure event distribution (median inter-failure gap)
+rather than picked arbitrarily, which is why the model achieves AUC 0.846 on real
+industrial data.
 
 **Why LangGraph for orchestration?**
 Human-in-the-loop interrupts are a first-class LangGraph concept. The `interrupt_before`
@@ -464,12 +452,14 @@ implementations gave full control over memory format, embedding storage, and Zet
 linking logic — and avoided dependency conflicts between LangGraph, motor, and external
 agent SDKs.
 
-**Why Azure Blob for model storage?**
-Azure Blob provides immutable, versioned artefact storage with a straightforward Python
-SDK. The `BlobServiceClient` API is simple enough to wrap completely in a 160-line
-service class with full graceful degradation. Keeping models out of the repository
-(never committed) and always trained from source data is also a deliberate MLOps
-discipline — it prevents model/code version drift.
+**Why local model storage instead of cloud storage?**
+Models are generated by running the training script once and stored in `ml/models/`
+(gitignored). This removes an external dependency at no cost for a single-deployment
+portfolio project. The `BlobStorageService` interface is kept as a stub so cloud
+storage can be restored by replacing one file — the `is_available` property and method
+signatures are identical to the Azure implementation. Keeping models out of the
+repository (gitignored) and always trainable from source data remains a deliberate
+MLOps discipline — it prevents model/code version drift.
 
 **Why PostgreSQL over MongoDB for training data?**
 Training data is tabular, with known schema, and benefits from SQL joins and window
@@ -501,7 +491,7 @@ are unavailable for `@pytest.mark.integration` tests).
 
 | Test Module | Tests | Coverage |
 |---|---|---|
-| `test_ml_models.py` | 20 | Scaler, IForest, LSTM, MLService |
+| `test_ml_models.py` | 15 | Scaler, LSTM Autoencoder, MLService |
 | `test_agents.py` | 20 | AnomalyDetector, AlertGenerator, Orchestrator, HITL |
 | `test_api.py` | 21 | All REST endpoints, validation, error handling |
 | `test_maintenance_logs.py` | 24 | Bulk add, list, count, Qdrant/MongoDB integration |
@@ -588,21 +578,22 @@ GET /health       Service status: ml_ready, redis, mongo, qdrant, blob_storage,
 
 ## Dataset
 
-**AI4I 2020 Predictive Maintenance Dataset** (UCI Machine Learning Repository)
+**Microsoft Azure Predictive Maintenance Dataset**
 
-- 10,000 synthetic CNC machine readings · 5 failure types
-- TWF (tool wear), HDF (heat dissipation), PWF (power), OSF (overstrain), RNF (random)
-- 339 failure rows (3.4%) · Features: air temp, process temp, rotational speed, torque, tool wear
+- 876,100 hourly sensor readings · 100 machines · 1 year
+- 761 failure events · 0.087% failure rate · 4 failure types (EVF · RSF · PBF · BWF)
+- Features: volt, rotate (rpm), pressure, vibration
+- `is_clean_normal` flag marks readings with no failure within the inter-failure window
 
 **Data flow:**
 ```
-UCI download  →  data/ai4i_2020.csv
+Kaggle download  →  data/azure_pdm/  (5 CSV files)
      ↓
-data/load_to_postgres.py  →  PostgreSQL sensor_readings table (10,000 rows)
+data/load_azure_to_postgres.py  →  PostgreSQL azure_sensor_readings (876,100 rows)
      ↓
-ml/train_*.py reads from PostgreSQL (CSV fallback if unavailable)
+ml/train_autoencoder_azure.py reads clean rows from PostgreSQL
      ↓
-Trained model  →  ml/models/*.pkl  →  Azure Blob Storage
+Trained model  →  ml/models/azure_lstm_autoencoder.keras  (stored locally in ml/models/)
      ↓
 MLflow registry  →  champion alias  →  MLService loads on startup
      ↓
@@ -613,11 +604,10 @@ Evidently AI compares live Redis window vs PostgreSQL reference (nightly)
 
 ---
 
-## Dataset Citation
+## Dataset Source
 
-> Matzka, S. (2020). *AI4I 2020 Predictive Maintenance Dataset*.
-> UCI Machine Learning Repository.
-> [https://doi.org/10.24432/C5HS5C](https://doi.org/10.24432/C5HS5C)
+Microsoft Azure Predictive Maintenance dataset available via Kaggle:
+[https://www.kaggle.com/datasets/arnabbiswas1/microsoft-azure-predictive-maintenance](https://www.kaggle.com/datasets/arnabbiswas1/microsoft-azure-predictive-maintenance)
 
 ---
 

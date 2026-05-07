@@ -1,13 +1,13 @@
 """
-Stream Simulator — reads AI4I 2020 CSV row-by-row and POSTs each row to
-POST /api/sensors/ingest every 0.5 seconds, simulating a live sensor feed.
+Stream Simulator — reads Azure PdM telemetry CSV row-by-row and POSTs each row to
+POST /api/sensors/ingest, simulating a live sensor feed.
 
 Features:
-  - Scans the dataset upfront and logs how many known failure rows it found
-  - Logs a warning each time a failure row is sent (so you can watch anomalies
-    appear in the server terminal)
-  - Loops over the dataset once (set LOOP=True to repeat)
-  - Configurable via CLI args or env vars
+  - Loads PdM_telemetry.csv and PdM_failures.csv, joins on machineID + datetime
+  - Sends rows in chronological order (sorted by datetime then machineID)
+  - Logs a WARNING each time a failure row is sent
+  - Loops over the dataset once (use --loop to repeat)
+  - Configurable via CLI args
 
 Run (server must be up first):
     python data/stream_simulator.py
@@ -17,89 +17,79 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import csv
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
+import pandas as pd
 from loguru import logger
 
-ROOT     = Path(__file__).parent.parent
-CSV_PATH = ROOT / "data" / "ai4i_2020.csv"
+ROOT            = Path(__file__).parent.parent
+TELEMETRY_PATH  = ROOT / "data" / "azure_pdm" / "PdM_telemetry.csv"
+FAILURES_PATH   = ROOT / "data" / "azure_pdm" / "PdM_failures.csv"
 
-COL_MAP = {
-    "Air temperature [K]":      "air_temperature",
-    "Process temperature [K]":  "process_temperature",
-    "Rotational speed [rpm]":   "rotational_speed",
-    "Torque [Nm]":              "torque",
-    "Tool wear [min]":          "tool_wear",
-    "Machine failure":          "machine_failure",
-    "TWF":                      "twf",
-    "HDF":                      "hdf",
-    "PWF":                      "pwf",
-    "OSF":                      "osf",
-    "RNF":                      "rnf",
-}
-
-FAILURE_COLS = {"twf", "hdf", "pwf", "osf", "rnf"}
+FAILURE_COMPONENTS = ["comp1", "comp2", "comp3", "comp4"]
 
 
 def load_rows() -> list[dict]:
-    """Load and normalise all CSV rows. Returns list of dicts."""
-    if not CSV_PATH.exists():
-        logger.error("Dataset not found at {}. Run data/download_data.py first.", CSV_PATH)
-        sys.exit(1)
+    """Load telemetry + failures, join, sort, return list of row dicts."""
+    for path in (TELEMETRY_PATH, FAILURES_PATH):
+        if not path.exists():
+            logger.error("Required file not found: {}. Run data/download_data.py first.", path)
+            sys.exit(1)
 
-    rows = []
-    with open(CSV_PATH, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for i, row in enumerate(reader):
-            normalised = {COL_MAP.get(k, k.lower()): v for k, v in row.items()}
-            normalised["_row_idx"] = i
-            rows.append(normalised)
+    telemetry = pd.read_csv(TELEMETRY_PATH, parse_dates=["datetime"])
+    failures  = pd.read_csv(FAILURES_PATH,  parse_dates=["datetime"])
 
-    failure_rows = [r for r in rows if int(r.get("machine_failure", 0)) == 1]
-    logger.info(
-        "Loaded {:,} rows — {:,} failure rows ({:.1f}%)",
-        len(rows),
-        len(failure_rows),
-        100 * len(failure_rows) / len(rows),
+    # Join failures onto telemetry — failure column is NaN for normal rows
+    merged = telemetry.merge(
+        failures.rename(columns={"failure": "_failure_type"}),
+        on=["datetime", "machineID"],
+        how="left",
     )
 
-    # Log which failure types are present
-    for col in FAILURE_COLS:
-        count = sum(1 for r in rows if int(r.get(col, 0)) == 1)
+    # Sort chronologically, then by machine for deterministic order within a timestamp
+    merged = merged.sort_values(["datetime", "machineID"]).reset_index(drop=True)
+
+    total         = len(merged)
+    failure_rows  = merged[merged["_failure_type"].notna()]
+    failure_rate  = 100.0 * len(failure_rows) / total if total else 0.0
+
+    # ── Startup summary ───────────────────────────────────────────────────────
+    print("=" * 60)
+    print("  DefectSense Stream Simulator — Azure PdM Dataset")
+    print("=" * 60)
+    print(f"  Total rows loaded : {total:,}")
+    print(f"  Failure rows      : {len(failure_rows):,}  ({failure_rate:.2f}%)")
+    print()
+    print("  Failure breakdown by component:")
+    for comp in FAILURE_COMPONENTS:
+        count = int((failure_rows["_failure_type"] == comp).sum())
         if count:
-            logger.info("  {:>4}  {} failures", count, col.upper())
+            print(f"    {comp:<6}: {count:,}")
+    print("=" * 60)
+    print()
 
-    return rows
+    return merged.to_dict("records")
 
 
-def row_to_payload(row: dict, machine_id_prefix: str = "M") -> dict:
-    """Convert a CSV row dict to the SensorReading JSON payload."""
-    udi = row.get("udi", row.get("_row_idx", 0))
-    machine_id = f"{machine_id_prefix}{int(udi):04d}"
+def machine_id_str(machine_id_int: int) -> str:
+    """Convert integer machineID → 'M001' format."""
+    return f"M{int(machine_id_int):03d}"
+
+
+def row_to_payload(row: dict) -> dict:
+    """Convert a merged row dict to the SensorReading JSON payload."""
     return {
-        "machine_id":          machine_id,
-        "timestamp":           datetime.now(tz=timezone.utc).isoformat(),
-        "air_temperature":     float(row["air_temperature"]),
-        "process_temperature": float(row["process_temperature"]),
-        "rotational_speed":    float(row["rotational_speed"]),
-        "torque":              float(row["torque"]),
-        "tool_wear":           float(row["tool_wear"]),
-        "source":              "ai4i",
+        "machine_id": machine_id_str(row["machineID"]),
+        "timestamp":  datetime.now(tz=timezone.utc).isoformat(),
+        "volt":       float(row["volt"]),
+        "rotate":     float(row["rotate"]),
+        "pressure":   float(row["pressure"]),
+        "vibration":  float(row["vibration"]),
+        "source":     "azure_pdm",
     }
-
-
-def is_failure_row(row: dict) -> str:
-    """Return the failure type string if this row is a failure, else empty string."""
-    if int(row.get("machine_failure", 0)) != 1:
-        return ""
-    for col in FAILURE_COLS:
-        if int(row.get(col, 0)) == 1:
-            return col.upper()
-    return "UNKNOWN"
 
 
 async def stream(
@@ -126,16 +116,19 @@ async def stream(
                     logger.info("Reached max_rows={}, stopping.", max_rows)
                     return
 
-                payload     = row_to_payload(row)
-                failure_tag = is_failure_row(row)
+                payload      = row_to_payload(row)
+                failure_type = row.get("_failure_type")
 
-                if failure_tag:
+                if pd.notna(failure_type) if failure_type is not None else False:
                     logger.warning(
-                        ">>> SENDING FAILURE ROW | {} | type={} | torque={} Nm | wear={} min",
+                        ">>> FAILURE ROW | {} | component={} | volt={:.2f} | rotate={:.2f}"
+                        " | pressure={:.2f} | vibration={:.2f}",
                         payload["machine_id"],
-                        failure_tag,
-                        payload["torque"],
-                        payload["tool_wear"],
+                        failure_type,
+                        payload["volt"],
+                        payload["rotate"],
+                        payload["pressure"],
+                        payload["vibration"],
                     )
 
                 try:
@@ -152,9 +145,10 @@ async def stream(
                             result.get("failure_probability", 0),
                             result.get("failure_type_prediction", "?"),
                         )
-                    elif sent % 50 == 0:
+
+                    if sent % 100 == 0:
                         logger.info(
-                            "  sent={:,} | anomalies={:,} | errors={:,}",
+                            "  rows sent={:,} | anomalies detected={:,} | errors={:,}",
                             sent, anomalies, errors,
                         )
 
@@ -179,17 +173,17 @@ async def stream(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="DefectSense stream simulator")
+    p = argparse.ArgumentParser(description="DefectSense stream simulator — Azure PdM")
     p.add_argument("--url",      default="http://localhost:8080", help="Base URL of the API server")
-    p.add_argument("--interval", type=float, default=0.5, help="Seconds between rows (default 0.5)")
-    p.add_argument("--loop",     action="store_true", help="Loop over dataset indefinitely")
-    p.add_argument("--max-rows", type=int,  default=0,   help="Stop after N rows (0 = no limit)")
+    p.add_argument("--interval", type=float, default=0.5,  help="Seconds between rows (default 0.5)")
+    p.add_argument("--loop",     action="store_true",       help="Loop over dataset indefinitely")
+    p.add_argument("--max-rows", type=int,   default=0,    help="Stop after N rows (0 = no limit)")
     return p.parse_args()
 
 
 if __name__ == "__main__":
-    args   = parse_args()
-    rows   = load_rows()
+    args = parse_args()
+    rows = load_rows()
 
     try:
         asyncio.run(

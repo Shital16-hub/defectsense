@@ -8,7 +8,7 @@ Takes a RootCauseReport and produces a MaintenanceAlert with:
   - Saves to MongoDB + publishes to Redis 'alerts:new' channel
 
 Plain language rules:
-  - NO acronyms (TWF → "tool wear", HDF → "overheating", etc.)
+  - NO acronyms (EVF → "electrical overload", BWF → "bearing wear", etc.)
   - Short sentences, imperative tone
   - Worker-facing: "Call the maintenance team NOW"
 """
@@ -27,17 +27,16 @@ CHANNEL_ALERTS = "alerts:new"
 
 # Maps failure type → plain language phrasing
 _FAILURE_PLAIN = {
-    "TWF": "the cutting tool is wearing out faster than expected",
-    "HDF": "the machine is overheating — the cooling system may be failing",
-    "PWF": "there is an electrical power problem with the motor",
-    "OSF": "the machine is being overloaded — mechanical strain detected",
-    "RNF": "an unusual fault has been detected with no single clear cause",
+    "EVF": "there is an electrical overload — voltage has spiked above safe levels",
+    "RSF": "the motor is losing speed — it cannot maintain normal rotation",
+    "PBF": "there is a pressure blockage — a line or valve may be seized",
+    "BWF": "there is mechanical wear — bearing vibration is above normal",
 }
 
 # Severity override rules: (condition_fn) → Severity
 _SEVERITY_RULES = [
     (lambda r: r.anomaly_result.failure_probability > 0.9,              "CRITICAL"),
-    (lambda r: r.anomaly_result.failure_type_prediction in ("TWF","HDF")
+    (lambda r: r.anomaly_result.failure_type_prediction in ("PBF", "BWF")
                and r.anomaly_result.failure_probability > 0.7,          "CRITICAL"),
     (lambda r: r.anomaly_result.failure_probability > 0.7,              "HIGH"),
     (lambda r: r.anomaly_result.failure_probability > 0.5,              "MEDIUM"),

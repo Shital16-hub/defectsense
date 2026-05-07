@@ -30,11 +30,10 @@ if TYPE_CHECKING:
 
 # Sensor display names for human-readable trend summaries
 SENSOR_LABELS = {
-    "air_temperature":     "air temperature",
-    "process_temperature": "process temperature",
-    "rotational_speed":    "rotational speed",
-    "torque":              "torque",
-    "tool_wear":           "tool wear",
+    "volt":      "voltage",
+    "rotate":    "rotation speed",
+    "pressure":  "pressure",
+    "vibration": "vibration",
 }
 
 
@@ -165,7 +164,7 @@ class ContextRetrieverAgent:
 
         lines = [f"Sensor trends over last {len(readings)} readings for {anomaly.machine_id}:"]
 
-        sensors = ["air_temperature", "process_temperature", "rotational_speed", "torque", "tool_wear"]
+        sensors = ["volt", "rotate", "pressure", "vibration"]
         for sensor in sensors:
             try:
                 vals = [getattr(r, sensor) for r in readings]
@@ -233,25 +232,24 @@ class ContextRetrieverAgent:
 
         agent = cls(qdrant=qdrant, redis=None)
 
-        # Mock anomaly — HDF (Heat Dissipation Failure)
+        # Mock anomaly — PBF (Pressure Blockage Failure) on Azure PdM sensors
         mock_anomaly = AnomalyResult(
-            machine_id="M0042",
+            machine_id="M001",
             timestamp=datetime.now(tz=timezone.utc),
             anomaly_score=0.87,
             failure_probability=0.74,
             is_anomaly=True,
-            failure_type_prediction="HDF",
+            failure_type_prediction="PBF",
             sensor_deltas={
-                "air_temperature":     2.1,
-                "process_temperature": 3.8,
-                "rotational_speed":   -0.4,
-                "torque":              1.2,
-                "tool_wear":           0.9,
+                "volt":      1.8,
+                "rotate":   -1.6,
+                "pressure":  0.3,
+                "vibration": 0.4,
             },
-            ml_model_used="ensemble",
+            ml_model_used="lstm_autoencoder",
         )
 
-        print(f"\nQuery anomaly: machine={mock_anomaly.machine_id} type={mock_anomaly.failure_type_prediction}")
+        print(f"\nQuery anomaly: machine={mock_anomaly.machine_id} type={mock_anomaly.failure_type_prediction} (Azure PdM sensors)")
         print(f"Built query: {agent._build_query(mock_anomaly)}\n")
 
         similar, sensor_ctx = await agent.retrieve(mock_anomaly)

@@ -28,57 +28,53 @@ def event_loop():
 def normal_reading() -> SensorReading:
     return SensorReading(
         machine_id="TEST_M001",
-        air_temperature=298.1,
-        process_temperature=308.6,
-        rotational_speed=1500.0,
-        torque=40.0,
-        tool_wear=50.0,
+        volt=176.22,
+        rotate=418.50,
+        pressure=113.08,
+        vibration=45.09,
         timestamp=datetime.utcnow(),
     )
 
 
 @pytest.fixture
 def failure_reading() -> SensorReading:
-    """HDF-like: low temp delta + low RPM + high torque."""
+    """BWF-like: high vibration indicating bearing wear."""
     return SensorReading(
         machine_id="TEST_M001",
-        air_temperature=302.0,
-        process_temperature=309.0,
-        rotational_speed=1182.0,
-        torque=68.5,
-        tool_wear=195.0,
+        volt=174.0,
+        rotate=443.0,
+        pressure=103.0,
+        vibration=62.0,
         timestamp=datetime.utcnow(),
     )
 
 
 @pytest.fixture
 def twf_reading() -> SensorReading:
-    """Tool wear failure: very high tool_wear."""
+    """EVF-like: high voltage indicating electrical overload."""
     return SensorReading(
         machine_id="TEST_M002",
-        air_temperature=298.0,
-        process_temperature=308.5,
-        rotational_speed=1400.0,
-        torque=50.0,
-        tool_wear=245.0,
+        volt=195.0,
+        rotate=450.0,
+        pressure=101.0,
+        vibration=41.0,
         timestamp=datetime.utcnow(),
     )
 
 
 @pytest.fixture
 def normal_reading_sequence(normal_reading) -> list[SensorReading]:
-    """30 slightly-varied normal readings for LSTM sequence."""
+    """198 slightly-varied normal readings for LSTM sequence (Azure model requires 198 steps)."""
     return [
         SensorReading(
             machine_id="TEST_M001",
-            air_temperature=298.0 + i * 0.02,
-            process_temperature=308.5 + i * 0.02,
-            rotational_speed=1498.0 + i * 0.1,
-            torque=40.0 + i * 0.05,
-            tool_wear=float(i),
+            volt=176.0 + i * 0.02,
+            rotate=418.0 + i * 0.1,
+            pressure=113.0 + i * 0.02,
+            vibration=45.0 + i * 0.01,
             timestamp=datetime.utcnow(),
         )
-        for i in range(30)
+        for i in range(198)
     ]
 
 
@@ -89,17 +85,16 @@ def sample_anomaly_result() -> AnomalyResult:
         anomaly_score=0.82,
         failure_probability=0.75,
         is_anomaly=True,
-        failure_type_prediction="HDF",
+        failure_type_prediction="RSF",
         sensor_deltas={
-            "air_temperature": 0.3,
-            "process_temperature": 3.1,
-            "rotational_speed": -2.2,
-            "torque": 2.8,
-            "tool_wear": 1.1,
+            "volt": 0.1,
+            "rotate": -2.2,
+            "pressure": 0.3,
+            "vibration": 0.8,
         },
-        ml_model_used="ensemble",
+        ml_model_used="lstm_autoencoder",
         reconstruction_error=0.045,
-        isolation_score=-0.12,
+        isolation_score=None,
     )
 
 
@@ -116,7 +111,7 @@ def sample_root_cause_report(sample_anomaly_result) -> RootCauseReport:
         ],
         recommended_actions=["Inspect cooling fan", "Schedule maintenance"],
         severity="HIGH",
-        reasoning_steps=["THINK: high temp delta detected", "CONCLUDE: HDF pattern"],
+        reasoning_steps=["THINK: rotation below threshold", "CONCLUDE: RSF pattern"],
     )
 
 

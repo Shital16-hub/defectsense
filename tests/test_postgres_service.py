@@ -16,23 +16,24 @@ import pytest
 
 def _make_normal_df(n: int = 100) -> pd.DataFrame:
     return pd.DataFrame({
-        "id":                  range(n),
-        "machine_id":          [f"M{i:03d}" for i in range(n)],
-        "air_temperature":     [300.0] * n,
-        "process_temperature": [310.0] * n,
-        "rotational_speed":    [1500.0] * n,
-        "torque":              [40.0] * n,
-        "tool_wear":           [50.0] * n,
-        "machine_failure":     [0] * n,
-        "failure_type":        ["NONE"] * n,
-        "machine_type":        ["L"] * n,
+        "id":              range(n),
+        "machine_id":      [f"M{i:03d}" for i in range(n)],
+        "volt":            [176.0] * n,
+        "rotate":          [420.0] * n,
+        "pressure":        [113.0] * n,
+        "vibration":       [45.0] * n,
+        "machine_failure": [0] * n,
+        "failure_type":    ["NONE"] * n,
+        "machine_model":   ["model1"] * n,
+        "is_clean_normal": [True] * n,
     })
 
 
 def _make_failure_df(n: int = 10) -> pd.DataFrame:
     df = _make_normal_df(n)
     df["machine_failure"] = 1
-    df["failure_type"] = "TWF"
+    df["failure_type"]    = "BWF"
+    df["is_clean_normal"] = False
     return df
 
 
@@ -74,20 +75,8 @@ class TestPostgresServiceInit:
 
 
 class TestPostgresServiceData:
-    def _connected_service(self, mock_df: pd.DataFrame):
-        """Return a PostgresService with _connected=True and a mocked engine."""
-        from app.services.postgres_service import PostgresService
-
-        svc = PostgresService("postgresql://user:pass@host/db")
-        svc._connected = True
-        svc._engine = MagicMock()
-
-        # Patch pd.read_sql to return mock_df
-        with patch("pandas.read_sql", return_value=mock_df):
-            yield svc
-
     def test_get_normal_samples_returns_dataframe(self):
-        """get_normal_samples() returns a DataFrame with machine_failure all zeros."""
+        """get_normal_samples() returns a DataFrame with is_clean_normal all True."""
         from app.services.postgres_service import PostgresService
 
         normal_df = _make_normal_df(100)
@@ -106,6 +95,7 @@ class TestPostgresServiceData:
 
         assert isinstance(result, pd.DataFrame)
         assert len(result) == 100
+        assert set(["volt", "rotate", "pressure", "vibration"]).issubset(result.columns)
         assert (result["machine_failure"] == 0).all()
 
     def test_get_failure_samples_returns_dataframe(self):
@@ -128,6 +118,7 @@ class TestPostgresServiceData:
 
         assert isinstance(result, pd.DataFrame)
         assert len(result) == 10
+        assert set(["volt", "rotate", "pressure", "vibration"]).issubset(result.columns)
         assert (result["machine_failure"] == 1).all()
 
     def test_get_machine_stats_returns_correct_keys(self):
@@ -135,18 +126,18 @@ class TestPostgresServiceData:
         from app.services.postgres_service import PostgresService
 
         # Build dataframes for each sequential read_sql call
-        totals_df = pd.DataFrame([{"total_rows": 10000, "failure_rows": 339, "normal_rows": 9661}])
+        totals_df = pd.DataFrame([{"total_rows": 876100, "failure_rows": 761, "normal_rows": 875339}])
         by_type_df = pd.DataFrame([
-            {"machine_type": "L", "count": 6000, "failures": 200},
-            {"machine_type": "M", "count": 3000, "failures": 100},
-            {"machine_type": "H", "count": 1000, "failures": 39},
+            {"machine_model": "model1", "count": 219025, "failures": 190},
+            {"machine_model": "model2", "count": 219025, "failures": 190},
+            {"machine_model": "model3", "count": 219025, "failures": 191},
+            {"machine_model": "model4", "count": 219025, "failures": 190},
         ])
         sensor_row = {
-            "air_temperature": 300.0,
-            "process_temperature": 310.0,
-            "rotational_speed": 1500.0,
-            "torque": 40.0,
-            "tool_wear": 50.0,
+            "volt":      176.0,
+            "rotate":    420.0,
+            "pressure":  113.0,
+            "vibration":  45.0,
         }
         means_df = pd.DataFrame([sensor_row])
 
@@ -172,8 +163,10 @@ class TestPostgresServiceData:
 
         required_keys = {"total_rows", "failure_rows", "normal_rows", "failure_rate", "by_machine_type"}
         assert required_keys.issubset(stats.keys())
-        assert stats["total_rows"] == 10000
-        assert stats["failure_rows"] == 339
+        assert stats["total_rows"] == 876100
+        assert stats["failure_rows"] == 761
+        assert "volt" in stats["sensor_means_normal"]
+        assert "vibration" in stats["sensor_means_failure"]
 
 
 class TestPostgresServiceGracefulDegradation:
@@ -211,48 +204,45 @@ class TestPostgresServiceGracefulDegradation:
 
 class TestTrainingFallback:
     def test_fallback_to_csv_when_postgres_unavailable(self, tmp_path):
-        """When PostgresService returns empty DataFrame, training falls back to CSV."""
+        """When PostgresService returns empty DataFrame, training falls back to Azure PdM CSV."""
         import numpy as np
-        from pathlib import Path
 
-        # Write a minimal valid CSV
-        csv_path = tmp_path / "ai4i_2020.csv"
+        # Write minimal valid Azure PdM telemetry CSV
+        csv_path = tmp_path / "PdM_telemetry.csv"
         n = 200
         df = pd.DataFrame({
-            "air_temperature":     np.random.uniform(295, 305, n),
-            "process_temperature": np.random.uniform(308, 313, n),
-            "rotational_speed":    np.random.uniform(1200, 2000, n),
-            "torque":              np.random.uniform(10, 70, n),
-            "tool_wear":           np.random.uniform(0, 250, n),
-            "machine_failure":     [0] * n,
+            "datetime":  ["2015-01-01 06:00:00"] * n,
+            "machineID": list(range(1, n + 1)),
+            "volt":      np.random.uniform(97, 251, n),
+            "rotate":    np.random.uniform(160, 684, n),
+            "pressure":  np.random.uniform(51, 182, n),
+            "vibration": np.random.uniform(15, 72, n),
         })
         df.to_csv(csv_path, index=False)
 
         from app.services.postgres_service import PostgresService
 
-        # Mock PostgresService to simulate unavailability
         mock_svc = MagicMock(spec=PostgresService)
         mock_svc.is_connected = False
         mock_svc.get_normal_samples.return_value = pd.DataFrame()
 
+        AZURE_FEATURES = ["volt", "rotate", "pressure", "vibration"]
+
         with patch("app.services.postgres_service.PostgresService", return_value=mock_svc):
-            # Inline the fallback logic as tested in load_and_prepare
             normal = pd.DataFrame()
 
             if normal.empty:
-                raw = pd.read_csv(csv_path)
-                normal = raw[raw["machine_failure"] == 0][
-                    ["air_temperature", "process_temperature",
-                     "rotational_speed", "torque", "tool_wear"]
-                ].dropna()
+                raw    = pd.read_csv(csv_path)
+                normal = raw[AZURE_FEATURES].dropna()
 
         assert len(normal) == n
         assert not normal.empty
+        assert set(AZURE_FEATURES).issubset(normal.columns)
 
 
 class TestLoadScriptIdempotent:
     def test_load_script_skips_when_rows_exist(self, capsys):
-        """If sensor_readings already has rows, load script prints 'Already loaded' and exits."""
+        """If azure_sensor_readings already has rows, load script prints 'Already loaded' and exits."""
         from unittest.mock import MagicMock, patch
 
         mock_engine = MagicMock()
@@ -261,11 +251,9 @@ class TestLoadScriptIdempotent:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_engine.connect.return_value = mock_conn
 
-        # First connect() call: CREATE TABLE
-        # Second connect() call: COUNT(*) → 10000
         execute_results = [
             MagicMock(),                          # CREATE TABLE
-            MagicMock(scalar=lambda: 10000),      # COUNT(*)
+            MagicMock(scalar=lambda: 876100),     # COUNT(*)
         ]
         call_count = {"n": 0}
 
@@ -280,18 +268,17 @@ class TestLoadScriptIdempotent:
         with patch("sqlalchemy.create_engine", return_value=mock_engine), \
              patch("os.getenv", side_effect=lambda k, d=None: "postgresql://x" if k == "POSTGRES_URL" else d), \
              patch("pathlib.Path.exists", return_value=True):
-            # Simulate what load_to_postgres.py does
             from sqlalchemy import create_engine, text
             engine = create_engine("postgresql://x", connect_args={"sslmode": "require"})
             with engine.connect() as conn:
-                conn.execute(text("CREATE TABLE IF NOT EXISTS sensor_readings (...)"))
+                conn.execute(text("CREATE TABLE IF NOT EXISTS azure_sensor_readings (...)"))
                 conn.commit()
             with engine.connect() as conn:
-                existing = int(conn.execute(text("SELECT COUNT(*) FROM sensor_readings")).scalar())
+                existing = int(conn.execute(text("SELECT COUNT(*) FROM azure_sensor_readings")).scalar())
 
             if existing > 0:
                 print(f"Already loaded: {existing:,} rows exist — skipping")
 
         captured = capsys.readouterr()
         assert "Already loaded" in captured.out
-        assert "10,000 rows exist — skipping" in captured.out
+        assert "876,100 rows exist — skipping" in captured.out

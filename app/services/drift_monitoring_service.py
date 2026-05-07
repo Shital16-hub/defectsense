@@ -19,6 +19,8 @@ Stored in MongoDB: drift_reports collection.
 from __future__ import annotations
 
 import re
+import sys
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -26,12 +28,13 @@ from typing import Optional
 import pandas as pd
 from loguru import logger
 
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
 FEATURES = [
-    "air_temperature",
-    "process_temperature",
-    "rotational_speed",
-    "torque",
-    "tool_wear",
+    "volt",
+    "rotate",
+    "pressure",
+    "vibration",
 ]
 
 # Evidently uses 0.5 as the default dataset-level drift threshold
@@ -44,10 +47,11 @@ class DriftMonitoringService:
     """Compares live Redis readings against PostgreSQL / CSV reference data."""
 
     def __init__(self, mongo_db=None, postgres_url: Optional[str] = None) -> None:
-        self._mongo         = mongo_db
-        self._postgres_url  = postgres_url
+        self._mongo                    = mongo_db
+        self._postgres_url             = postgres_url
         self._reference_data: Optional[pd.DataFrame] = None
-        self._ready         = False
+        self._ready                    = False
+        self._last_retraining_triggered: Optional[datetime] = None
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -65,6 +69,11 @@ class DriftMonitoringService:
     def is_ready(self) -> bool:
         return self._ready and self._reference_data is not None
 
+    @property
+    def last_retraining_triggered(self) -> Optional[datetime]:
+        """Timestamp of the last time automatic retraining was triggered, or None."""
+        return self._last_retraining_triggered
+
     # ── Reference data ─────────────────────────────────────────────────────────
 
     async def load_reference_data(self) -> None:
@@ -72,41 +81,61 @@ class DriftMonitoringService:
         # ── PostgreSQL ─────────────────────────────────────────────────────────
         if self._postgres_url:
             try:
-                from app.services.postgres_service import PostgresService
-                pg = PostgresService(self._postgres_url)
-                pg.init()
-                if pg.is_connected:
-                    df = pg.get_normal_samples()
-                    pg.close()
-                    if len(df) >= 100 and all(f in df.columns for f in FEATURES):
-                        self._reference_data = df[FEATURES].dropna().reset_index(drop=True)
-                        logger.info(
-                            "DriftMonitor: loaded {:,} reference samples from PostgreSQL",
-                            len(self._reference_data),
-                        )
-                        return
+                from sqlalchemy import create_engine, text
+                engine = create_engine(self._postgres_url)
+                with engine.connect() as conn:
+                    df = pd.read_sql(
+                        text(
+                            "SELECT volt, rotate, pressure, vibration "
+                            "FROM azure_sensor_readings "
+                            "WHERE is_clean_normal = TRUE"
+                        ),
+                        conn,
+                    )
+                engine.dispose()
+                if len(df) >= 100:
+                    self._reference_data = df[FEATURES].dropna().reset_index(drop=True)
+                    logger.info(
+                        "DriftMonitor: loaded {:,} reference samples from PostgreSQL",
+                        len(self._reference_data),
+                    )
+                    return
             except Exception as exc:
                 logger.warning("DriftMonitor: PostgreSQL reference load failed — {}", exc)
 
         # ── CSV fallback ───────────────────────────────────────────────────────
         try:
-            csv_path = Path(__file__).parent.parent.parent / "data" / "ai4i_2020.csv"
-            if not csv_path.exists():
-                logger.warning("DriftMonitor: CSV not found at {}", csv_path)
+            azure_dir = Path(__file__).parent.parent.parent / "data" / "azure_pdm"
+            telemetry_path = azure_dir / "PdM_telemetry.csv"
+            failures_path  = azure_dir / "PdM_failures.csv"
+
+            if not telemetry_path.exists():
+                logger.warning("DriftMonitor: CSV not found at {}", telemetry_path)
                 self._reference_data = None
                 return
 
-            df = pd.read_csv(csv_path)
-            col_map = {
-                "Air temperature [K]":       "air_temperature",
-                "Process temperature [K]":   "process_temperature",
-                "Rotational speed [rpm]":    "rotational_speed",
-                "Torque [Nm]":               "torque",
-                "Tool wear [min]":           "tool_wear",
-                "Machine failure":           "machine_failure",
-            }
-            df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-            normal = df[df["machine_failure"] == 0][FEATURES].dropna().reset_index(drop=True)
+            telemetry = pd.read_csv(telemetry_path)
+
+            if failures_path.exists():
+                try:
+                    failures = pd.read_csv(failures_path)
+                    # Mark failure rows by joining on machineID + datetime
+                    failure_keys = set(
+                        zip(failures["machineID"].astype(str), failures["datetime"].astype(str))
+                    )
+                    telemetry["_is_failure"] = list(zip(
+                        telemetry["machineID"].astype(str),
+                        telemetry["datetime"].astype(str),
+                    ))
+                    telemetry["_is_failure"] = telemetry["_is_failure"].isin(failure_keys)
+                    normal = telemetry.loc[~telemetry["_is_failure"], FEATURES].dropna().reset_index(drop=True)
+                except (KeyError, Exception):
+                    # Failures join not possible — use all telemetry rows as reference
+                    normal = telemetry[FEATURES].dropna().reset_index(drop=True)
+            else:
+                # No failures file — use all telemetry rows as reference
+                normal = telemetry[FEATURES].dropna().reset_index(drop=True)
+
             self._reference_data = normal
             logger.info(
                 "DriftMonitor: loaded {:,} reference samples from CSV fallback",
@@ -170,14 +199,15 @@ class DriftMonitoringService:
                         }
 
             report_doc = {
-                "run_at":             datetime.now(tz=timezone.utc).isoformat(),
-                "is_drifted":         is_drifted,
-                "drift_share":        drift_share,
-                "n_features_drifted": n_drifted,
-                "total_features":     len(FEATURES),
-                "reference_size":     len(self._reference_data),
-                "current_size":       len(current_data),
-                "feature_details":    feature_details,
+                "run_at":                datetime.now(tz=timezone.utc).isoformat(),
+                "is_drifted":            is_drifted,
+                "drift_share":           drift_share,
+                "n_features_drifted":    n_drifted,
+                "total_features":        len(FEATURES),
+                "reference_size":        len(self._reference_data),
+                "current_size":          len(current_data),
+                "feature_details":       feature_details,
+                "retraining_triggered":  is_drifted,
             }
 
             if is_drifted:
@@ -197,11 +227,47 @@ class DriftMonitoringService:
                 except Exception as exc:
                     logger.warning("DriftMonitor: MongoDB save failed — {}", exc)
 
+            # ── Trigger retraining if drift was detected ───────────────────────
+            if is_drifted:
+                await self._trigger_retraining()
+
             return report_doc
 
         except Exception as exc:
             logger.warning("DriftMonitor: report run failed — {}", exc)
             return {"error": str(exc), "is_drifted": False}
+
+    # ── Retraining trigger ─────────────────────────────────────────────────────
+
+    async def _trigger_retraining(self) -> None:
+        """
+        Fire-and-forget: launch both ML training scripts as background subprocesses.
+
+        Called automatically when drift is detected. Never raises — any failure
+        is logged as a WARNING so drift monitoring continues unaffected.
+        """
+        try:
+            logger.warning(
+                "DriftMonitor: drift detected — triggering automatic retraining"
+            )
+            scripts = [
+                "ml/train_autoencoder_azure.py",
+            ]
+            for script in scripts:
+                subprocess.Popen(
+                    [sys.executable, script],
+                    cwd=str(_PROJECT_ROOT),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            self._last_retraining_triggered = datetime.now(tz=timezone.utc)
+            logger.info(
+                "DriftMonitor: retraining jobs submitted as background processes"
+            )
+        except Exception as exc:
+            logger.warning(
+                "DriftMonitor: failed to trigger retraining (non-fatal) — {}", exc
+            )
 
     # ── Redis window ───────────────────────────────────────────────────────────
 

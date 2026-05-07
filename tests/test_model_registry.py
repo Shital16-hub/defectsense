@@ -102,7 +102,7 @@ class TestGetLatestVersion:
         client.get_run.return_value = _make_run(metrics={"auc": 0.93})
 
         svc = _patched_registry(client)
-        result = svc.get_latest_version("defectsense_isolation_forest", stage="Production")
+        result = svc.get_latest_version("defectsense_lstm_autoencoder", stage="Production")
 
         assert result is not None
         assert result["version"] == 1
@@ -116,10 +116,10 @@ class TestGetLatestVersion:
         client.get_model_version_by_alias.side_effect = Exception("not found")
 
         svc = _patched_registry(client)
-        svc.get_latest_version("defectsense_isolation_forest", stage="Production")
+        svc.get_latest_version("defectsense_lstm_autoencoder", stage="Production")
 
         client.get_model_version_by_alias.assert_called_once_with(
-            "defectsense_isolation_forest", "champion"
+            "defectsense_lstm_autoencoder", "champion"
         )
 
     def test_stage_staging_maps_to_challenger_alias(self):
@@ -128,10 +128,10 @@ class TestGetLatestVersion:
         client.get_model_version_by_alias.side_effect = Exception("not found")
 
         svc = _patched_registry(client)
-        svc.get_latest_version("defectsense_isolation_forest", stage="Staging")
+        svc.get_latest_version("defectsense_lstm_autoencoder", stage="Staging")
 
         client.get_model_version_by_alias.assert_called_once_with(
-            "defectsense_isolation_forest", "challenger"
+            "defectsense_lstm_autoencoder", "challenger"
         )
 
 
@@ -148,7 +148,7 @@ class TestGetAllVersions:
         ]
 
         svc = _patched_registry(client)
-        result = svc.get_all_versions("defectsense_isolation_forest")
+        result = svc.get_all_versions("defectsense_lstm_autoencoder")
 
         assert len(result) == 2
         assert result[0]["version"] == 1
@@ -162,7 +162,7 @@ class TestGetAllVersions:
         client.get_run.return_value = _make_run(metrics={"auc": 0.93})
 
         svc = _patched_registry(client)
-        result = svc.get_all_versions("defectsense_isolation_forest")
+        result = svc.get_all_versions("defectsense_lstm_autoencoder")
 
         assert result[0]["alias"]   == "champion"
         assert result[0]["aliases"] == ["champion"]
@@ -175,7 +175,7 @@ class TestGetAllVersions:
         client.get_run.return_value = _make_run(metrics={"auc": 0.929})
 
         svc = _patched_registry(client)
-        result = svc.get_all_versions("defectsense_isolation_forest")
+        result = svc.get_all_versions("defectsense_lstm_autoencoder")
 
         assert result[0]["auc"] == pytest.approx(0.929)
 
@@ -187,7 +187,7 @@ class TestGetAllVersions:
         client.get_run.return_value = _make_run(metrics={"roc_auc": 0.85})
 
         svc = _patched_registry(client)
-        result = svc.get_all_versions("defectsense_isolation_forest")
+        result = svc.get_all_versions("defectsense_lstm_autoencoder")
 
         assert result[0]["auc"] == pytest.approx(0.85)
 
@@ -199,7 +199,7 @@ class TestGetAllVersions:
         client.get_run.return_value = _make_run(metrics={"precision": 0.5})
 
         svc = _patched_registry(client)
-        result = svc.get_all_versions("defectsense_isolation_forest")
+        result = svc.get_all_versions("defectsense_lstm_autoencoder")
 
         assert result[0]["auc"] is None
 
@@ -211,7 +211,7 @@ class TestGetAllVersions:
         client.get_run.return_value = _make_run()
 
         svc = _patched_registry(client)
-        result = svc.get_all_versions("defectsense_isolation_forest")
+        result = svc.get_all_versions("defectsense_lstm_autoencoder")
 
         assert result[0]["alias"]   == ""
         assert result[0]["aliases"] == []
@@ -237,10 +237,10 @@ class TestPromoteToProduction:
         client.get_model_version_by_alias.side_effect = Exception("no champion")
 
         svc = _patched_registry(client)
-        svc.promote_to_production("defectsense_isolation_forest", version=2)
+        svc.promote_to_production("defectsense_lstm_autoencoder", version=2)
 
         client.set_registered_model_alias.assert_called_once_with(
-            name="defectsense_isolation_forest",
+            name="defectsense_lstm_autoencoder",
             alias="champion",
             version="2",
         )
@@ -252,10 +252,10 @@ class TestPromoteToProduction:
         client.get_model_version_by_alias.return_value = v1  # v1 is current champion
 
         svc = _patched_registry(client)
-        svc.promote_to_production("defectsense_isolation_forest", version=2)
+        svc.promote_to_production("defectsense_lstm_autoencoder", version=2)
 
         client.delete_registered_model_alias.assert_called_once_with(
-            "defectsense_isolation_forest", "champion"
+            "defectsense_lstm_autoencoder", "champion"
         )
 
     def test_no_delete_if_promoting_current_champion(self):
@@ -265,7 +265,7 @@ class TestPromoteToProduction:
         client.get_model_version_by_alias.return_value = v1
 
         svc = _patched_registry(client)
-        svc.promote_to_production("defectsense_isolation_forest", version=1)
+        svc.promote_to_production("defectsense_lstm_autoencoder", version=1)
 
         client.delete_registered_model_alias.assert_not_called()
 
@@ -275,7 +275,7 @@ class TestPromoteToProduction:
         client.get_model_version_by_alias.side_effect = Exception("no champion")
 
         svc = _patched_registry(client)
-        result = svc.promote_to_production("defectsense_isolation_forest", version=1)
+        result = svc.promote_to_production("defectsense_lstm_autoencoder", version=1)
 
         assert result is True
 
@@ -286,7 +286,7 @@ class TestPromoteToProduction:
         client.set_registered_model_alias.side_effect = Exception("mlflow down")
 
         svc = _patched_registry(client)
-        result = svc.promote_to_production("defectsense_isolation_forest", version=1)
+        result = svc.promote_to_production("defectsense_lstm_autoencoder", version=1)
 
         assert result is False
 
@@ -302,16 +302,16 @@ class TestRollback:
         client.get_model_version.return_value = _make_model_version(1)  # v1 exists
 
         svc = _patched_registry(client)
-        result = svc.rollback("defectsense_isolation_forest")
+        result = svc.rollback("defectsense_lstm_autoencoder")
 
         assert result is True
         # delete current champion
         client.delete_registered_model_alias.assert_called_once_with(
-            "defectsense_isolation_forest", "champion"
+            "defectsense_lstm_autoencoder", "champion"
         )
         # set champion on v1
         client.set_registered_model_alias.assert_called_once_with(
-            name="defectsense_isolation_forest",
+            name="defectsense_lstm_autoencoder",
             alias="champion",
             version="1",
         )
@@ -323,7 +323,7 @@ class TestRollback:
         client.get_model_version_by_alias.return_value = v1
 
         svc = _patched_registry(client)
-        result = svc.rollback("defectsense_isolation_forest")
+        result = svc.rollback("defectsense_lstm_autoencoder")
 
         assert result is False
 
@@ -333,7 +333,7 @@ class TestRollback:
         client.get_model_version_by_alias.side_effect = Exception("no champion")
 
         svc = _patched_registry(client)
-        result = svc.rollback("defectsense_isolation_forest")
+        result = svc.rollback("defectsense_lstm_autoencoder")
 
         assert result is False
 
@@ -345,7 +345,7 @@ class TestRollback:
         client.get_model_version.side_effect = Exception("v2 not found")
 
         svc = _patched_registry(client)
-        result = svc.rollback("defectsense_isolation_forest")
+        result = svc.rollback("defectsense_lstm_autoencoder")
 
         assert result is False
 
@@ -366,7 +366,7 @@ class TestCompareVersions:
         ]
 
         svc = _patched_registry(client)
-        result = svc.compare_versions("defectsense_isolation_forest", 1, 2)
+        result = svc.compare_versions("defectsense_lstm_autoencoder", 1, 2)
 
         assert "version1"       in result
         assert "version2"       in result
@@ -385,7 +385,7 @@ class TestCompareVersions:
         ]
 
         svc = _patched_registry(client)
-        result = svc.compare_versions("defectsense_isolation_forest", 1, 2)
+        result = svc.compare_versions("defectsense_lstm_autoencoder", 1, 2)
 
         assert result["better_version"] == 2
 
@@ -395,6 +395,6 @@ class TestCompareVersions:
         client.search_model_versions.return_value = []
 
         svc = _patched_registry(client)
-        result = svc.compare_versions("defectsense_isolation_forest", 1, 2)
+        result = svc.compare_versions("defectsense_lstm_autoencoder", 1, 2)
 
         assert result == {}

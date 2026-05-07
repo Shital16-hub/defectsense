@@ -34,7 +34,7 @@ class TestAnomalyDetectorAgent:
         from app.agents.anomaly_detector import AnomalyDetectorAgent
         mock_ml_service.predict_anomaly = AsyncMock(return_value=AnomalyResult(
             machine_id="TEST_M001", anomaly_score=0.1, failure_probability=0.1,
-            is_anomaly=False, sensor_deltas={}, ml_model_used="isolation_forest",
+            is_anomaly=False, sensor_deltas={}, ml_model_used="none",
         ))
         agent = AnomalyDetectorAgent(ml_service=mock_ml_service, redis_service=mock_redis)
         await agent.run(normal_reading)
@@ -46,7 +46,7 @@ class TestAnomalyDetectorAgent:
         from app.agents.anomaly_detector import AnomalyDetectorAgent
         mock_ml_service.predict_anomaly = AsyncMock(return_value=AnomalyResult(
             machine_id="TEST_M001", anomaly_score=0.9, failure_probability=0.85,
-            is_anomaly=True, sensor_deltas={}, ml_model_used="ensemble",
+            is_anomaly=True, sensor_deltas={}, ml_model_used="lstm_autoencoder",
         ))
         agent  = AnomalyDetectorAgent(ml_service=mock_ml_service,
                                       redis_service=mock_redis, mongo_db=mock_mongo)
@@ -60,7 +60,7 @@ class TestAnomalyDetectorAgent:
         from app.agents.anomaly_detector import AnomalyDetectorAgent
         mock_ml_service.predict_anomaly = AsyncMock(return_value=AnomalyResult(
             machine_id="TEST_M001", anomaly_score=0.9, failure_probability=0.85,
-            is_anomaly=True, sensor_deltas={}, ml_model_used="ensemble",
+            is_anomaly=True, sensor_deltas={}, ml_model_used="lstm_autoencoder",
         ))
         agent = AnomalyDetectorAgent(ml_service=mock_ml_service, redis_service=mock_redis)
         await agent.run(normal_reading)
@@ -72,7 +72,7 @@ class TestAnomalyDetectorAgent:
         from app.agents.anomaly_detector import AnomalyDetectorAgent
         mock_ml_service.predict_anomaly = AsyncMock(return_value=AnomalyResult(
             machine_id="TEST_M001", anomaly_score=0.1, failure_probability=0.1,
-            is_anomaly=False, sensor_deltas={}, ml_model_used="isolation_forest",
+            is_anomaly=False, sensor_deltas={}, ml_model_used="none",
         ))
         agent = AnomalyDetectorAgent(ml_service=mock_ml_service,
                                      redis_service=mock_redis, mongo_db=mock_mongo)
@@ -80,14 +80,14 @@ class TestAnomalyDetectorAgent:
         mock_mongo["anomalies"].insert_one.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_sequence_fetch_failure_falls_back_to_iforest(
+    async def test_sequence_fetch_failure_returns_safe_result(
         self, normal_reading, mock_ml_service
     ):
-        """If Redis.get_recent_readings raises, agent falls back to IForest-only."""
+        """If Redis.get_recent_readings raises, agent calls predict_anomaly with sequence=None."""
         from app.agents.anomaly_detector import AnomalyDetectorAgent
         mock_ml_service.predict_anomaly = AsyncMock(return_value=AnomalyResult(
-            machine_id="TEST_M001", anomaly_score=0.3, failure_probability=0.3,
-            is_anomaly=False, sensor_deltas={}, ml_model_used="isolation_forest",
+            machine_id="TEST_M001", anomaly_score=0.0, failure_probability=0.0,
+            is_anomaly=False, sensor_deltas={}, ml_model_used="none",
         ))
         broken_redis = MagicMock()
         broken_redis.is_connected        = False
@@ -130,18 +130,24 @@ class TestAlertGeneratorSeverity:
         sev    = self._agent()._compute_severity(report)
         assert sev == "CRITICAL"
 
-    def test_critical_twf_above_70pct(self):
-        report = self._make_report(0.75, "TWF")
+    def test_high_evf_above_70pct(self):
+        """EVF at >70% probability is HIGH (only PBF/BWF escalate to CRITICAL)."""
+        report = self._make_report(0.75, "EVF")
+        sev    = self._agent()._compute_severity(report)
+        assert sev == "HIGH"
+
+    def test_critical_pbf_above_70pct(self):
+        report = self._make_report(0.75, "PBF")
         sev    = self._agent()._compute_severity(report)
         assert sev == "CRITICAL"
 
-    def test_critical_hdf_above_70pct(self):
-        report = self._make_report(0.75, "HDF")
+    def test_critical_bwf_above_70pct(self):
+        report = self._make_report(0.75, "BWF")
         sev    = self._agent()._compute_severity(report)
         assert sev == "CRITICAL"
 
-    def test_high_above_70pct_non_twf_hdf(self):
-        report = self._make_report(0.75, "PWF")
+    def test_high_above_70pct_non_pbf_bwf(self):
+        report = self._make_report(0.75, "RSF")
         sev    = self._agent()._compute_severity(report)
         assert sev == "HIGH"
 
@@ -208,7 +214,7 @@ class TestOrchestratorHITL:
 
         mock_ml_service.predict_anomaly = AsyncMock(return_value=AnomalyResult(
             machine_id="TEST_M001", anomaly_score=0.1, failure_probability=0.1,
-            is_anomaly=False, sensor_deltas={}, ml_model_used="isolation_forest",
+            is_anomaly=False, sensor_deltas={}, ml_model_used="none",
         ))
         detector = AnomalyDetectorAgent(ml_service=mock_ml_service,
                                         redis_service=mock_redis, mongo_db=mock_mongo)
@@ -259,10 +265,10 @@ class TestPostResolutionIndexer:
                 "recommended_actions": ["Inspect cooling fan", "Schedule maintenance"],
                 "anomaly_result": {
                     "machine_id":              "TEST_M001",
-                    "failure_type_prediction": "HDF",
+                    "failure_type_prediction": "RSF",
                     "sensor_deltas": {
-                        "process_temperature": 3.1,
-                        "rotational_speed":    -2.2,
+                        "rotate":    -2.2,
+                        "vibration": 0.8,
                     },
                 },
             },
@@ -298,7 +304,7 @@ class TestPostResolutionIndexer:
 
         call_json = mock_client.post.call_args[1]["json"]
         assert call_json["machine_id"]   == "TEST_M001"
-        assert call_json["failure_type"] == "HDF"
+        assert call_json["failure_type"] == "RSF"
         assert call_json["technician"]   == "test_engineer"
 
     @pytest.mark.asyncio

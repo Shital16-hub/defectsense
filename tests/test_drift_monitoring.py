@@ -16,11 +16,10 @@ from app.models.sensor import SensorReading
 from datetime import datetime
 
 FEATURES = [
-    "air_temperature",
-    "process_temperature",
-    "rotational_speed",
-    "torque",
-    "tool_wear",
+    "volt",
+    "rotate",
+    "pressure",
+    "vibration",
 ]
 
 
@@ -29,23 +28,20 @@ FEATURES = [
 def _normal_df(n: int = 200) -> pd.DataFrame:
     rng = np.random.default_rng(42)
     return pd.DataFrame({
-        "air_temperature":     rng.uniform(295, 305, n),
-        "process_temperature": rng.uniform(308, 313, n),
-        "rotational_speed":    rng.uniform(1200, 2000, n),
-        "torque":              rng.uniform(10, 70, n),
-        "tool_wear":           rng.uniform(0, 250, n),
-        "machine_failure":     [0] * n,
+        "volt":      rng.uniform(97, 251, n),
+        "rotate":    rng.uniform(160, 684, n),
+        "pressure":  rng.uniform(51, 182, n),
+        "vibration": rng.uniform(15, 72, n),
     })
 
 
 def _shifted_df(n: int = 50, multiplier: float = 5.0) -> pd.DataFrame:
     rng = np.random.default_rng(99)
     return pd.DataFrame({
-        "air_temperature":     rng.uniform(295, 305, n) * multiplier,
-        "process_temperature": rng.uniform(308, 313, n) * multiplier,
-        "rotational_speed":    rng.uniform(1200, 2000, n) * multiplier,
-        "torque":              rng.uniform(10, 70, n) * multiplier,
-        "tool_wear":           rng.uniform(0, 250, n) * multiplier,
+        "volt":      rng.uniform(97, 251, n) * multiplier,
+        "rotate":    rng.uniform(160, 684, n) * multiplier,
+        "pressure":  rng.uniform(51, 182, n) * multiplier,
+        "vibration": rng.uniform(15, 72, n) * multiplier,
     })
 
 
@@ -55,11 +51,10 @@ def _make_readings(n: int = 50) -> list[SensorReading]:
     for i in range(n):
         readings.append(SensorReading(
             machine_id="M001",
-            air_temperature=float(rng.uniform(296, 304)),
-            process_temperature=float(rng.uniform(309, 312)),
-            rotational_speed=float(rng.uniform(1300, 1900)),
-            torque=float(rng.uniform(15, 65)),
-            tool_wear=float(rng.uniform(1, 240)),
+            volt=float(rng.uniform(97, 251)),
+            rotate=float(rng.uniform(160, 684)),
+            pressure=float(rng.uniform(51, 182)),
+            vibration=float(rng.uniform(15, 72)),
             timestamp=datetime.utcnow(),
         ))
     return readings

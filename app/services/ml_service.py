@@ -1,19 +1,19 @@
 """
-ML Inference Service — loads trained LSTM Autoencoder + Isolation Forest and runs
-ensemble anomaly detection.
+ML Inference Service — loads trained LSTM Autoencoder and runs anomaly detection.
 
-Key design decisions vs the previous version:
+Key design decisions:
   - Sequence is built OUTSIDE this service (by AnomalyDetectorAgent from Redis cache)
     so this service is stateless and reusable across workers.
   - All CPU-bound inference runs in a thread-pool executor to avoid blocking the
     async event loop.
   - Each prediction is logged to an MLflow run kept open for the lifetime of the app.
-  - High-confidence detection: reconstruction_error > threshold AND iforest == -1.
+  - is_anomaly = reconstruction_error > threshold  (LSTM only)
 """
 from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json as _json
 import pickle
 import threading
 import time
@@ -30,30 +30,26 @@ from app.models.sensor import SensorReading
 ROOT       = Path(__file__).parent.parent.parent
 MODELS_DIR = ROOT / "ml" / "models"
 
-AUTOENCODER_PATH = MODELS_DIR / "lstm_autoencoder.keras"
-SCALER_PATH      = MODELS_DIR / "sensor_scaler.pkl"
-THRESHOLD_PATH   = MODELS_DIR / "anomaly_threshold.pkl"
-IFOREST_PATH     = MODELS_DIR / "isolation_forest.pkl"
+AUTOENCODER_PATH = MODELS_DIR / "azure_lstm_autoencoder.keras"
+SCALER_PATH      = MODELS_DIR / "azure_sensor_scaler.pkl"
+THRESHOLD_PATH   = MODELS_DIR / "azure_anomaly_threshold.pkl"
 
 FEATURES = [
-    "air_temperature",
-    "process_temperature",
-    "rotational_speed",
-    "torque",
-    "tool_wear",
+    "volt",
+    "rotate",
+    "pressure",
+    "vibration",
 ]
 
-SEQUENCE_LENGTH = 30
+N_FEATURES = 4
 
-# Rule-based failure-type heuristics (AI4I domain knowledge)
-_FAILURE_RULES: list[tuple[str, str, float, str]] = [
-    ("tool_wear",           "high", 2.0, "TWF"),
-    ("air_temperature",     "high", 2.5, "HDF"),
-    ("process_temperature", "high", 2.5, "HDF"),
-    ("rotational_speed",    "low",  2.0, "PWF"),
-    ("torque",              "high", 2.5, "PWF"),
-    ("rotational_speed",    "high", 2.5, "OSF"),
-]
+# ── Sequence length — read from config if available ───────────────────────────
+_config_path = Path(__file__).parent.parent.parent / "data" / "azure_lstm_config.json"
+try:
+    with open(_config_path) as _f:
+        SEQUENCE_LENGTH = int(_json.load(_f)["sequence_length"])
+except Exception:
+    SEQUENCE_LENGTH = 30
 
 
 class MLService:
@@ -66,18 +62,17 @@ class MLService:
     """
 
     def __init__(self, blob_service=None) -> None:
-        self._autoencoder   = None
-        self._scaler        = None
+        self._autoencoder    = None
+        self._scaler         = None
         self._threshold_data: dict = {}
-        self._iforest       = None
-        self._loaded        = False
-        self._executor      = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-        self._blob_service  = blob_service  # optional BlobStorageService
+        self._loaded         = False
+        self._executor       = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        self._blob_service   = blob_service  # optional BlobStorageService
 
         # MLflow prediction tracking
         self._mlflow_run_id: Optional[str] = None
-        self._pred_step     = 0
-        self._mlflow_lock   = threading.Lock()
+        self._pred_step      = 0
+        self._mlflow_lock    = threading.Lock()
 
     # ── Loading ────────────────────────────────────────────────────────────────
 
@@ -92,34 +87,33 @@ class MLService:
 
         logger.info("MLService: loading artefacts from {}", MODELS_DIR)
 
-        # ── helper: try blob download if local file missing ───────────────────
+        # ── helper: check local file exists (blob storage is disabled) ──────
         def _ensure_local(path: Path, blob_name: str) -> bool:
             if path.exists():
                 return True
-            if self._blob_service is not None and self._blob_service.is_available:
-                logger.info("  MLService: '{}' missing locally — downloading from blob...", path.name)
-                ok = self._blob_service.download_model(blob_name, path)
-                if ok:
-                    return True
-                logger.error("  MLService: blob download failed for '{}'", blob_name)
+            logger.error(
+                "  MLService: model file not found at '{}' and blob storage is "
+                "disabled — run ml/train_autoencoder_azure.py to generate this file.",
+                path.name,
+            )
             return False
 
         # ── LSTM Autoencoder ─────────────────────────────────────────────────
-        if _ensure_local(AUTOENCODER_PATH, "lstm_autoencoder_latest.keras"):
+        if _ensure_local(AUTOENCODER_PATH, "azure_lstm_autoencoder_latest.keras"):
             import tensorflow as tf  # deferred — slow import
             self._autoencoder = tf.keras.models.load_model(str(AUTOENCODER_PATH))
-            logger.info("  ✓ LSTM Autoencoder loaded")
+            logger.info("  ✓ Azure LSTM Autoencoder loaded")
         else:
-            logger.warning("  ✗ Autoencoder not found — run ml/train_autoencoder.py")
+            logger.warning("  ✗ Autoencoder not found — run ml/train_autoencoder_azure.py")
 
         # ── Sensor scaler ────────────────────────────────────────────────────
-        if _ensure_local(SCALER_PATH, "sensor_scaler_latest.pkl"):
+        if _ensure_local(SCALER_PATH, "azure_sensor_scaler_latest.pkl"):
             with open(SCALER_PATH, "rb") as f:
                 self._scaler = pickle.load(f)
             logger.info("  ✓ Sensor scaler loaded")
 
         # ── Anomaly threshold ────────────────────────────────────────────────
-        if _ensure_local(THRESHOLD_PATH, "anomaly_threshold_latest.pkl"):
+        if _ensure_local(THRESHOLD_PATH, "azure_anomaly_threshold_latest.pkl"):
             with open(THRESHOLD_PATH, "rb") as f:
                 self._threshold_data = pickle.load(f)
             logger.info(
@@ -127,28 +121,13 @@ class MLService:
                 self._threshold_data.get("threshold", 0.0),
             )
 
-        # ── Isolation Forest ─────────────────────────────────────────────────
-        if _ensure_local(IFOREST_PATH, "isolation_forest_latest.pkl"):
-            with open(IFOREST_PATH, "rb") as f:
-                iforest_data = pickle.load(f)
-            # pkl was saved as a dict: {"model": ..., "scaler": ..., ...}
-            if isinstance(iforest_data, dict):
-                self._iforest = iforest_data["model"]
-            else:
-                self._iforest = iforest_data
-            logger.info("  ✓ Isolation Forest loaded")
-        else:
-            logger.warning("  ✗ Isolation Forest not found — run ml/train_isolation_forest.py")
-
         self._loaded = True
         self._init_mlflow()
         logger.info("MLService ready.")
 
     @property
     def is_ready(self) -> bool:
-        return self._loaded and (
-            self._autoencoder is not None or self._iforest is not None
-        )
+        return self._loaded and self._autoencoder is not None
 
     @property
     def is_blob_available(self) -> bool:
@@ -165,16 +144,16 @@ class MLService:
         sequence: Optional[list[SensorReading]] = None,
     ) -> AnomalyResult:
         """
-        Run ensemble anomaly detection.
+        Run LSTM anomaly detection.
 
         Args:
             reading:  The current SensorReading to evaluate.
             sequence: Last N SensorReadings for this machine (from Redis cache).
                       If len(sequence) < SEQUENCE_LENGTH, LSTM is skipped and
-                      only Isolation Forest runs.
+                      no detection is performed.
 
         Returns:
-            AnomalyResult with scores, confidence flags, failure type, and deltas.
+            AnomalyResult with scores and sensor deltas.
         """
         if not self._loaded:
             self.load()
@@ -185,8 +164,6 @@ class MLService:
 
         lstm_recon_error: Optional[float] = None
         lstm_above_threshold              = False
-        iforest_prediction: Optional[int] = None
-        iforest_score: Optional[float]    = None
         ml_model_used                     = "none"
 
         # ── LSTM Autoencoder (CPU-bound → thread pool) ────────────────────────
@@ -203,35 +180,12 @@ class MLService:
             lstm_above_threshold = lstm_recon_error > threshold
             ml_model_used = "lstm_autoencoder"
 
-        # ── Isolation Forest (CPU-bound → thread pool) ───────────────────────
-        if self._iforest is not None:
-            iforest_prediction, iforest_score = await loop.run_in_executor(
-                self._executor, self._run_iforest, scaled
-            )
-            ml_model_used = (
-                "ensemble" if ml_model_used == "lstm_autoencoder" else "isolation_forest"
-            )
-
-        # ── Confidence classification ─────────────────────────────────────────
-        #   HIGH:   both models flag anomaly
-        #   MEDIUM: only one model flags anomaly
-        #   NONE:   neither
-        high_confidence = lstm_above_threshold and iforest_prediction == -1
-        medium_confidence = lstm_above_threshold or iforest_prediction == -1
-        is_anomaly = high_confidence or medium_confidence
-
-        anomaly_score = self._compute_anomaly_score(
-            lstm_recon_error, iforest_score, high_confidence
-        )
+        is_anomaly  = lstm_above_threshold
+        anomaly_score = self._compute_anomaly_score(lstm_recon_error)
         failure_probability = float(np.clip(anomaly_score * 1.15, 0.0, 1.0))
 
         # ── Sensor deltas ─────────────────────────────────────────────────────
         sensor_deltas = self._compute_deltas(scaled, sequence)
-
-        # ── Failure type ──────────────────────────────────────────────────────
-        failure_type: Optional[FailureType] = None
-        if is_anomaly:
-            failure_type = self._infer_failure_type(sensor_deltas)
 
         result = AnomalyResult(
             machine_id=reading.machine_id,
@@ -239,14 +193,14 @@ class MLService:
             anomaly_score=round(anomaly_score, 4),
             failure_probability=round(failure_probability, 4),
             is_anomaly=is_anomaly,
-            failure_type_prediction=failure_type,
+            failure_type_prediction=None,
             sensor_deltas=sensor_deltas,
             ml_model_used=ml_model_used,
             reconstruction_error=lstm_recon_error,
-            isolation_score=iforest_score,
+            isolation_score=None,
         )
 
-        # Log to MLflow in background thread (run_in_executor returns a Future, not a coroutine)
+        # Log to MLflow in background thread
         loop.run_in_executor(self._executor, self._log_to_mlflow, result)
 
         return result
@@ -258,12 +212,6 @@ class MLService:
         reconstructed = self._autoencoder.predict(sequence, verbose=0)
         mse = float(np.mean(np.power(sequence - reconstructed, 2)))
         return mse
-
-    def _run_iforest(self, scaled: np.ndarray) -> tuple[int, float]:
-        """Run Isolation Forest; return (prediction, decision_score)."""
-        pred  = int(self._iforest.predict(scaled.reshape(1, -1))[0])    # 1 or -1
-        score = float(self._iforest.decision_function(scaled.reshape(1, -1))[0])
-        return pred, score
 
     # ── MLflow prediction tracking ─────────────────────────────────────────────
 
@@ -309,9 +257,9 @@ class MLService:
     def _scale(self, raw: np.ndarray) -> np.ndarray:
         if self._scaler is not None:
             return self._scaler.transform(raw.reshape(1, -1))[0].astype(np.float32)
-        # Fallback: approximate AI4I ranges
-        mins = np.array([295.0, 305.0, 1168.0, 3.8, 0.0],   dtype=np.float32)
-        maxs = np.array([304.0, 314.0, 2886.0, 76.6, 253.0], dtype=np.float32)
+        # Fallback: approximate Azure PdM ranges [volt, rotate, pressure, vibration]
+        mins = np.array([97.3,  160.3, 51.2, 14.9], dtype=np.float32)
+        maxs = np.array([250.9, 683.5, 182.1, 72.3], dtype=np.float32)
         return np.clip((raw - mins) / (maxs - mins + 1e-8), 0.0, 1.0)
 
     def _build_sequence_array(self, readings: list[SensorReading]) -> np.ndarray:
@@ -319,37 +267,14 @@ class MLService:
         rows = [self._scale(self._to_raw(r)) for r in readings]
         return np.array(rows, dtype=np.float32)[np.newaxis, ...]
 
-    def _compute_anomaly_score(
-        self,
-        recon_error: Optional[float],
-        iforest_score: Optional[float],
-        high_confidence: bool,
-    ) -> float:
+    def _compute_anomaly_score(self, recon_error: Optional[float]) -> float:
         threshold = self._threshold_data.get("threshold", 1.0) or 1.0
 
-        lstm_norm = 0.0
-        if recon_error is not None:
-            lstm_norm = float(np.clip(recon_error / (threshold * 2.0), 0.0, 1.0))
+        if recon_error is None:
+            return 0.0
 
-        iforest_norm = 0.0
-        if iforest_score is not None:
-            # IForest decision_function: negative = anomalous, range ~ [-0.5, 0.5]
-            iforest_norm = float(np.clip((-iforest_score + 0.5), 0.0, 1.0))
-
-        if lstm_norm and iforest_norm:
-            score = 0.6 * lstm_norm + 0.4 * iforest_norm
-        elif lstm_norm:
-            score = lstm_norm
-        elif iforest_norm:
-            score = iforest_norm
-        else:
-            score = 0.0
-
-        # Boost score slightly for confirmed high-confidence detections
-        if high_confidence:
-            score = min(score * 1.1, 1.0)
-
-        return round(score, 4)
+        lstm_norm = float(np.clip(recon_error / (threshold * 2.0), 0.0, 1.0))
+        return round(lstm_norm, 4)
 
     def _compute_deltas(
         self,
@@ -365,16 +290,3 @@ class MLService:
         std     = history.std(axis=0) + 1e-8
         z       = (scaled - mean) / std
         return {f: round(float(v), 3) for f, v in zip(FEATURES, z)}
-
-    def _infer_failure_type(self, deltas: dict[str, float]) -> Optional[FailureType]:
-        candidates: list[tuple[float, str]] = []
-        for feature, direction, z_thresh, ftype in _FAILURE_RULES:
-            z = deltas.get(feature, 0.0)
-            if direction == "high" and z >= z_thresh:
-                candidates.append((z, ftype))
-            elif direction == "low" and z <= -z_thresh:
-                candidates.append((-z, ftype))
-        if not candidates:
-            return None
-        candidates.sort(reverse=True)
-        return candidates[0][1]  # type: ignore[return-value]

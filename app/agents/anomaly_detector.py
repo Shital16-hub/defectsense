@@ -3,7 +3,7 @@ Anomaly Detector Agent — orchestrates sequence retrieval → ML inference → 
 
 Flow per SensorReading:
   1. Store reading in Redis cache (always)
-  2. Fetch last 30 readings for this machine from Redis → build LSTM sequence
+  2. Fetch last SEQUENCE_LENGTH readings for this machine from Redis → build LSTM sequence
   3. Call MLService.predict_anomaly(reading, sequence)
   4. If anomaly detected:
        - Log AnomalyResult to MongoDB
@@ -13,13 +13,15 @@ Flow per SensorReading:
 
 Handles gracefully:
   - Model not loaded → returns placeholder with is_anomaly=False
-  - Redis unavailable → runs IForest-only (no LSTM sequence)
-  - Insufficient sequence length (< 30) → runs IForest-only
+  - Redis unavailable → LSTM skipped (insufficient sequence)
+  - Insufficient sequence length → LSTM skipped
   - MongoDB unavailable → logs warning, continues
 """
 from __future__ import annotations
 
+import json as _json
 from datetime import datetime, timezone
+from pathlib import Path as _Path
 from typing import TYPE_CHECKING, Optional
 
 from loguru import logger
@@ -31,7 +33,16 @@ if TYPE_CHECKING:
     from app.services.ml_service import MLService
     from app.services.redis_service import RedisService
 
-SEQUENCE_LENGTH = 30
+# ── Sequence length — read from config if available ───────────────────────────
+_config_path = _Path(__file__).parent.parent.parent / "data" / "azure_lstm_config.json"
+try:
+    with open(_config_path) as _f:
+        SEQUENCE_LENGTH = int(_json.load(_f)["sequence_length"])
+except Exception:
+    SEQUENCE_LENGTH = 30
+
+logger.info("AnomalyDetectorAgent: SEQUENCE_LENGTH={} (from azure_lstm_config.json)", SEQUENCE_LENGTH)
+
 MONGODB_COLLECTION = "anomalies"
 
 
@@ -74,7 +85,7 @@ class AnomalyDetectorAgent:
         sequence = await self._get_sequence(reading.machine_id)
         if len(sequence) < SEQUENCE_LENGTH:
             logger.debug(
-                "AnomalyDetector: only {}/{} readings for {} — LSTM skipped, IForest only",
+                "AnomalyDetector: only {}/{} readings for {} — LSTM skipped (insufficient sequence)",
                 len(sequence),
                 SEQUENCE_LENGTH,
                 reading.machine_id,
