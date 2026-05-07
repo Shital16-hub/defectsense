@@ -286,7 +286,7 @@ class TestPostResolutionIndexer:
 
         mock_response = MagicMock()
         mock_response.raise_for_status = MagicMock(return_value=None)
-        mock_response.json = MagicMock(return_value={"log_id": "abc-123"})
+        mock_response.json = MagicMock(return_value={"log_id": "abc-123", "qdrant_upserted": True})
 
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(return_value=mock_response)

@@ -147,11 +147,15 @@ class TestAddMaintenanceLog:
         r      = client.post("/api/maintenance-logs/add", json=bad)
         assert r.status_code == 422
 
-    def test_add_log_qdrant_unavailable_returns_503(self):
+    def test_add_log_qdrant_unavailable_degrades_gracefully(self):
+        """When Qdrant is unavailable the /add endpoint returns 200 with qdrant_upserted=False."""
         app    = make_test_app(qdrant_unavailable=True)
         client = TestClient(app, raise_server_exceptions=False)
         r      = client.post("/api/maintenance-logs/add", json=VALID_LOG)
-        assert r.status_code == 503
+        assert r.status_code == 200
+        body = r.json()
+        assert body["qdrant_upserted"] is False
+        assert body["mongo_saved"] is True
 
     def test_add_log_mongodb_unavailable_returns_503(self):
         app    = make_test_app(mongo_unavailable=True)

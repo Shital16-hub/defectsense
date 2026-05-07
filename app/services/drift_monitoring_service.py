@@ -239,13 +239,31 @@ class DriftMonitoringService:
 
     # ── Retraining trigger ─────────────────────────────────────────────────────
 
+    # Minimum hours between automatic retraining runs to prevent hammering the
+    # training script if drift persists across multiple consecutive drift checks.
+    RETRAINING_COOLDOWN_HOURS = 24
+
     async def _trigger_retraining(self) -> None:
         """
-        Fire-and-forget: launch both ML training scripts as background subprocesses.
+        Fire-and-forget: launch ML training script as a background subprocess.
 
-        Called automatically when drift is detected. Never raises — any failure
-        is logged as a WARNING so drift monitoring continues unaffected.
+        Called automatically when drift is detected. Includes a 24-hour cooldown
+        so that persistent drift does not spawn a new training process on every
+        nightly check. Never raises — any failure is logged as a WARNING so drift
+        monitoring continues unaffected.
         """
+        # Cooldown check — skip if training was triggered recently
+        if self._last_retraining_triggered is not None:
+            elapsed_hours = (
+                datetime.now(tz=timezone.utc) - self._last_retraining_triggered
+            ).total_seconds() / 3600
+            if elapsed_hours < self.RETRAINING_COOLDOWN_HOURS:
+                logger.info(
+                    "DriftMonitor: retraining cooldown active ({:.1f}h < {}h) — skipping",
+                    elapsed_hours, self.RETRAINING_COOLDOWN_HOURS,
+                )
+                return
+
         try:
             logger.warning(
                 "DriftMonitor: drift detected — triggering automatic retraining"

@@ -611,11 +611,24 @@ class DefectSenseOrchestrator:
                 )
                 resp.raise_for_status()
 
-            logger.info(
-                "post_resolution_indexer: SUCCESS log={} machine={} type={}",
-                log.log_id[:8], log.machine_id, log.failure_type,
-            )
-            return {"auto_indexed": True}
+            # auto_indexed=True only when the log was actually indexed in Qdrant
+            # (qdrant_upserted=False means Qdrant was unavailable at index time)
+            resp_data    = resp.json()
+            qdrant_ok    = resp_data.get("qdrant_upserted", False)
+            auto_indexed = bool(qdrant_ok)
+
+            if auto_indexed:
+                logger.info(
+                    "post_resolution_indexer: SUCCESS — RAG indexed log={} machine={} type={}",
+                    log.log_id[:8], log.machine_id, log.failure_type,
+                )
+            else:
+                logger.warning(
+                    "post_resolution_indexer: log saved to MongoDB but NOT RAG-indexed "
+                    "(Qdrant unavailable) log={} machine={} type={}",
+                    log.log_id[:8], log.machine_id, log.failure_type,
+                )
+            return {"auto_indexed": auto_indexed}
 
         except Exception as exc:
             logger.warning(

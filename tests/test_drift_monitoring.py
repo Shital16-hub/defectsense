@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 from app.models.sensor import SensorReading
-from datetime import datetime
+from datetime import datetime, timezone
 
 FEATURES = [
     "volt",
@@ -223,6 +223,49 @@ class TestCurrentWindowData:
 
 
 # ── Full orchestration ─────────────────────────────────────────────────────────
+
+class TestRetrainingCooldown:
+    @pytest.mark.asyncio
+    async def test_retraining_not_triggered_within_cooldown(self):
+        """_trigger_retraining() skips if called within 24h of the last trigger."""
+        from app.services.drift_monitoring_service import DriftMonitoringService
+        from datetime import timedelta
+
+        svc = DriftMonitoringService()
+        # Simulate a trigger 1 hour ago
+        svc._last_retraining_triggered = datetime.now(timezone.utc) - timedelta(hours=1)
+
+        with patch("app.services.drift_monitoring_service.subprocess.Popen") as mock_popen:
+            await svc._trigger_retraining()
+        mock_popen.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retraining_triggered_after_cooldown(self):
+        """_trigger_retraining() fires when last trigger was > 24h ago."""
+        from app.services.drift_monitoring_service import DriftMonitoringService
+        from datetime import timedelta
+
+        svc = DriftMonitoringService()
+        # Simulate a trigger 25 hours ago
+        svc._last_retraining_triggered = datetime.now(timezone.utc) - timedelta(hours=25)
+
+        with patch("app.services.drift_monitoring_service.subprocess.Popen") as mock_popen:
+            await svc._trigger_retraining()
+        mock_popen.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_retraining_triggered_when_never_run(self):
+        """_trigger_retraining() fires when _last_retraining_triggered is None."""
+        from app.services.drift_monitoring_service import DriftMonitoringService
+
+        svc = DriftMonitoringService()
+        assert svc._last_retraining_triggered is None
+
+        with patch("app.services.drift_monitoring_service.subprocess.Popen") as mock_popen:
+            await svc._trigger_retraining()
+        mock_popen.assert_called_once()
+        assert svc._last_retraining_triggered is not None
+
 
 class TestFullDriftCheck:
     @pytest.mark.asyncio

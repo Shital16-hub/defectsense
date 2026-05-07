@@ -67,17 +67,30 @@ def _get_qdrant(request: Request):
 async def add_maintenance_log(log: MaintenanceLog, request: Request):
     """
     Embed and upsert a single MaintenanceLog into Qdrant, then save to MongoDB.
-    Both services must be available; returns 503 if either is down.
+
+    MongoDB is required (returns 503 if unavailable).
+    Qdrant is optional — if unavailable the log is saved to MongoDB only and
+    qdrant_upserted=False is returned.  The post_resolution_indexer uses this
+    flag to set auto_indexed correctly.
     """
     from loguru import logger
-    from app.services.mongodb_service import MongoDBService
 
     db     = _get_mongo(request)
-    qdrant = _get_qdrant(request)
+    qdrant = getattr(request.app.state, "qdrant", None)  # optional — degrade gracefully
 
-    # Upsert to Qdrant
-    qdrant_count = await qdrant.upsert_logs([log])
-    qdrant_ok    = qdrant_count == 1
+    # Upsert to Qdrant (optional)
+    qdrant_ok = False
+    if qdrant is not None:
+        try:
+            qdrant_count = await qdrant.upsert_logs([log])
+            qdrant_ok    = qdrant_count == 1
+        except Exception as exc:
+            logger.warning("add_maintenance_log: Qdrant upsert failed — {}", exc)
+    else:
+        logger.warning(
+            "add_maintenance_log: Qdrant unavailable — log saved to MongoDB only "
+            "(not RAG-indexed); log_id={}", log.log_id
+        )
 
     # Save to MongoDB directly via the motor db handle
     from datetime import datetime, timezone
