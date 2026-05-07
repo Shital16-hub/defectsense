@@ -200,7 +200,18 @@ class DefectSenseOrchestrator:
         rejection_reason: Optional[str] = None,
         auto: bool = False,
     ) -> dict:
-        """Resume a paused pipeline with a human decision."""
+        """Resume a paused pipeline with a human decision.
+
+        aupdate_state(as_node="apply_approval") writes a new checkpoint that
+        contains ONLY the injected values — the prior state (machine_id,
+        session_id, alert, etc.) is NOT visible to _node_post_resolution_indexer
+        when ainvoke(None) resumes.  We work around this in two ways:
+
+          1. Re-inject machine_id and session_id (from thread_id) so the
+             indexer can query MongoDB to find the alert.
+          2. Apply the MongoDB alert approval update here directly, because
+             aupdate_state bypasses _node_apply_approval entirely.
+        """
         if self._graph is None:
             raise RuntimeError("Orchestrator not built")
 
@@ -209,11 +220,28 @@ class DefectSenseOrchestrator:
         sid        = parts[1] if len(parts) > 1 else thread_id
         config     = self._make_config(thread_id, machine_id, sid)
 
+        # ── Apply MongoDB alert status update ──────────────────────────────────
+        # _node_apply_approval is bypassed by aupdate_state, so we must update
+        # the alert document here.  The API route already does this for manual
+        # approvals; for auto-approve this is the only place it happens.
+        await self._apply_approval_to_mongo(
+            session_id=sid,
+            approved=approved,
+            approved_by=approved_by,
+            rejection_reason=rejection_reason,
+            auto=auto,
+        )
+
+        # ── Inject state for _node_post_resolution_indexer ─────────────────────
+        # machine_id and session_id are re-injected so the indexer can locate
+        # the alert in MongoDB even though prior state fields are absent.
         update: dict = {
             "approved":         approved,
             "approved_by":      approved_by,
             "rejection_reason": rejection_reason,
             "auto_approved":    auto,
+            "machine_id":       machine_id,
+            "session_id":       sid,
         }
         await self._graph.aupdate_state(config, update, as_node="apply_approval")
 
@@ -224,6 +252,51 @@ class DefectSenseOrchestrator:
 
         final_state = await self._graph.ainvoke(None, config=config)
         return {**final_state, "thread_id": thread_id}
+
+    async def _apply_approval_to_mongo(
+        self,
+        session_id: str,
+        approved: bool,
+        approved_by: str,
+        rejection_reason: Optional[str],
+        auto: bool,
+    ) -> None:
+        """
+        Directly update the alert document in MongoDB with the approval decision.
+
+        Called from resume() because aupdate_state() bypasses _node_apply_approval.
+        Idempotent — safe to call even if the API route already updated the document.
+        """
+        if self._mongo_db is None:
+            return
+        from datetime import datetime, timezone
+        try:
+            fields: dict = {
+                "approved":      approved,
+                "approved_by":   approved_by,
+                "approved_at":   datetime.now(tz=timezone.utc).isoformat(),
+                "auto_approved": auto,
+            }
+            if not approved and rejection_reason:
+                fields["rejection_reason"] = rejection_reason
+
+            result = await self._mongo_db["alerts"].update_one(
+                {"session_id": session_id},
+                {"$set": fields},
+            )
+            if result.matched_count:
+                logger.info(
+                    "Orchestrator.resume: alert approved={} by={} | session={}",
+                    approved, approved_by, session_id[:8],
+                )
+            else:
+                logger.warning(
+                    "Orchestrator.resume: no alert found for session_id={} — "
+                    "MongoDB update skipped",
+                    session_id[:8],
+                )
+        except Exception as exc:
+            logger.warning("Orchestrator.resume: MongoDB alert update failed — {}", exc)
 
     # ── Nodes ──────────────────────────────────────────────────────────────────
 
@@ -354,9 +427,8 @@ class DefectSenseOrchestrator:
         Only runs when approved=True. Wraps everything in try/except so it
         can never fail the pipeline — a logging failure is not a pipeline failure.
 
-        After LangGraph resume(), aupdate_state only injects the approval fields;
-        all other state keys (alert, anomaly_result, root_cause_report, machine_id,
-        session_id) are absent. MongoDB is therefore the primary data source.
+        machine_id and session_id are re-injected by resume() via aupdate_state
+        so the MongoDB lookup always succeeds.
         """
         if state.get("approved") is not True:
             logger.debug(
@@ -375,12 +447,20 @@ class DefectSenseOrchestrator:
                 return {"auto_indexed": False}
 
             # ── Locate the alert in MongoDB ────────────────────────────────────
-            # Try session_id first (most specific), then machine_id + approved_by
+            # Priority:
+            #   1. session_id (injected by resume() — most specific)
+            #   2. machine_id + approved_by (fallback)
+            #   3. machine_id only — most-recently approved (last resort)
             alert_doc = None
 
             session_id      = state.get("session_id")
             machine_id_hint = state.get("machine_id")
             approved_by     = state.get("approved_by")
+
+            logger.debug(
+                "post_resolution_indexer: state keys available — session_id={} machine_id={} approved_by={}",
+                session_id, machine_id_hint, approved_by,
+            )
 
             # Also pull hints from the alert object if it survived in state
             alert_obj = state.get("alert")
@@ -388,24 +468,43 @@ class DefectSenseOrchestrator:
                 machine_id_hint = machine_id_hint or getattr(alert_obj, "machine_id", None)
                 session_id      = session_id      or getattr(alert_obj, "session_id",  None)
 
-            queries: list[dict] = []
+            # Query 1: exact session_id lookup (use find_one — unique key)
             if session_id:
-                queries.append({"session_id": session_id})
-            if machine_id_hint and machine_id_hint != "UNKNOWN" and approved_by:
-                queries.append({"machine_id": machine_id_hint, "approved": True, "approved_by": approved_by})
-
-            for query in queries:
                 try:
-                    doc = await self._mongo_db["alerts"].find_one(query, {"_id": 0})
-                    if doc:
-                        alert_doc = doc
+                    alert_doc = await self._mongo_db["alerts"].find_one(
+                        {"session_id": session_id}, {"_id": 0}
+                    )
+                    if alert_doc:
                         logger.info(
-                            "post_resolution_indexer: found alert via {} machine_id={}",
-                            list(query.keys()), doc.get("machine_id"),
+                            "post_resolution_indexer: found alert via session_id machine_id={}",
+                            alert_doc.get("machine_id"),
                         )
-                        break
                 except Exception as exc:
-                    logger.warning("post_resolution_indexer: query {} failed — {}", list(query.keys()), exc)
+                    logger.warning("post_resolution_indexer: session_id query failed — {}", exc)
+
+            # Query 2 & 3: fallback on machine_id when session_id lookup missed
+            if alert_doc is None and machine_id_hint and machine_id_hint != "UNKNOWN":
+                fallback_queries: list[dict] = []
+                if approved_by:
+                    fallback_queries.append(
+                        {"machine_id": machine_id_hint, "approved": True, "approved_by": approved_by}
+                    )
+                # Last resort: most recently approved alert for this machine
+                fallback_queries.append({"machine_id": machine_id_hint, "approved": True})
+
+                for query in fallback_queries:
+                    try:
+                        cursor = self._mongo_db["alerts"].find(query, {"_id": 0}).sort("approved_at", -1).limit(1)
+                        docs = await cursor.to_list(length=1)
+                        if docs:
+                            alert_doc = docs[0]
+                            logger.info(
+                                "post_resolution_indexer: found alert via {} machine_id={}",
+                                list(query.keys()), alert_doc.get("machine_id"),
+                            )
+                            break
+                    except Exception as exc:
+                        logger.warning("post_resolution_indexer: query {} failed — {}", list(query.keys()), exc)
 
             if alert_doc is None:
                 logger.warning(
