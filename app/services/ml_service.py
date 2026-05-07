@@ -179,6 +179,14 @@ class MLService:
             threshold = self._threshold_data.get("threshold", 0.0)
             lstm_above_threshold = lstm_recon_error > threshold
             ml_model_used = "lstm_autoencoder"
+        elif sequence is not None and len(sequence) < SEQUENCE_LENGTH:
+            # Buffer is filling up — model is warming up, not absent
+            ml_model_used = "buffering"
+            logger.debug(
+                "MLService: buffering {}/{} readings for machine sequence",
+                len(sequence),
+                SEQUENCE_LENGTH,
+            )
 
         is_anomaly  = lstm_above_threshold
         anomaly_score = self._compute_anomaly_score(lstm_recon_error)
@@ -187,13 +195,16 @@ class MLService:
         # ── Sensor deltas ─────────────────────────────────────────────────────
         sensor_deltas = self._compute_deltas(scaled, sequence)
 
+        # ── Failure type classification (rule-based on z-score deltas) ────────
+        failure_type = self._classify_failure_type(sensor_deltas) if is_anomaly else None
+
         result = AnomalyResult(
             machine_id=reading.machine_id,
             timestamp=reading.timestamp,
             anomaly_score=round(anomaly_score, 4),
             failure_probability=round(failure_probability, 4),
             is_anomaly=is_anomaly,
-            failure_type_prediction=None,
+            failure_type_prediction=failure_type,
             sensor_deltas=sensor_deltas,
             ml_model_used=ml_model_used,
             reconstruction_error=lstm_recon_error,
@@ -275,6 +286,48 @@ class MLService:
 
         lstm_norm = float(np.clip(recon_error / (threshold * 2.0), 0.0, 1.0))
         return round(lstm_norm, 4)
+
+    def _classify_failure_type(self, sensor_deltas: dict[str, float]) -> Optional[str]:
+        """
+        Rule-based failure type classification from sensor z-score deltas.
+
+        Azure PdM failure types and their dominant sensor signatures:
+          BWF — Bearing Wear Failure:      vibration spike  (vibration z > 2.0)
+          RSF — Rotor Speed Failure:       rotation drop    (rotate z < -2.0)
+          PBF — Pressure Blockage Failure: pressure spike   (pressure z > 2.0)
+          EVF — Electrical Overload Failure: voltage spike  (volt z > 2.0)
+
+        Rules are evaluated in priority order; the first match wins.
+        Returns None if no sensor exceeds the threshold (anomaly without
+        a clear single-sensor signature).
+        """
+        vib  = sensor_deltas.get("vibration", 0.0)
+        rot  = sensor_deltas.get("rotate",    0.0)
+        pres = sensor_deltas.get("pressure",  0.0)
+        volt = sensor_deltas.get("volt",      0.0)
+
+        # Priority order matches Azure PdM failure frequency (BWF most common)
+        if vib  >  2.0:
+            return "BWF"
+        if rot  < -2.0:
+            return "RSF"
+        if pres >  2.0:
+            return "PBF"
+        if volt >  2.0:
+            return "EVF"
+
+        # Secondary thresholds — dominant sensor wins by magnitude
+        candidates = {
+            "BWF": vib,
+            "RSF": -rot,   # negative because RSF is a drop
+            "PBF": pres,
+            "EVF": volt,
+        }
+        dominant, magnitude = max(candidates.items(), key=lambda x: x[1])
+        if magnitude > 1.0:
+            return dominant
+
+        return None
 
     def _compute_deltas(
         self,

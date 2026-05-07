@@ -61,18 +61,17 @@ def _post(path: str, body: dict) -> dict:
 def get_machine_list() -> list[str]:
     data = _get("/api/dashboard/machines")
     machines = data.get("machines", [])
-    return [m["machine_id"] for m in machines] if machines else ["(no machines yet)"]
+    return [m["machine_id"] for m in machines] if machines else []
 
 
 def build_sensor_chart(machine_id: str) -> go.Figure:
     fig = make_subplots(
-        rows=2, cols=3,
-        subplot_titles=["Air Temp (K)", "Process Temp (K)", "RPM",
-                        "Torque (Nm)", "Tool Wear (min)", ""],
-        vertical_spacing=0.18, horizontal_spacing=0.08,
+        rows=2, cols=2,
+        subplot_titles=["Volt (V)", "Rotate (RPM)", "Pressure (bar)", "Vibration (mm/s)"],
+        vertical_spacing=0.22, horizontal_spacing=0.10,
     )
 
-    if not machine_id or "no machines" in machine_id.lower():
+    if not machine_id:
         fig.update_layout(title="Select a machine", template="plotly_dark", height=420)
         return fig
 
@@ -91,11 +90,10 @@ def build_sensor_chart(machine_id: str) -> go.Figure:
             ts.append(datetime.utcnow())
 
     sensors = [
-        ("air_temperature",     "#60a5fa", 1, 1),
-        ("process_temperature", "#f87171", 1, 2),
-        ("rotational_speed",    "#34d399", 1, 3),
-        ("torque",              "#fbbf24", 2, 1),
-        ("tool_wear",           "#a78bfa", 2, 2),
+        ("volt",      "#60a5fa", 1, 1),
+        ("rotate",    "#f87171", 1, 2),
+        ("pressure",  "#34d399", 2, 1),
+        ("vibration", "#fbbf24", 2, 2),
     ]
     for key, colour, row, col in sensors:
         vals = [r.get(key) for r in readings]
@@ -116,7 +114,7 @@ def build_sensor_chart(machine_id: str) -> go.Figure:
 def build_anomaly_gauge(machine_id: str) -> go.Figure:
     prob, status, colour = 0.0, "UNKNOWN", "#6b7280"
 
-    if machine_id and "no machines" not in machine_id.lower():
+    if machine_id:
         machines = _get("/api/dashboard/machines").get("machines", [])
         m = next((x for x in machines if x["machine_id"] == machine_id), None)
         if m:
@@ -245,7 +243,7 @@ def load_root_cause(choice: str):
         f"**Root Cause:** {rcr.get('root_cause', 'N/A')}\n\n"
         f"**Severity:** {rcr.get('severity', '')}  |  "
         f"**Confidence:** {rcr.get('confidence', 0):.0%}\n\n"
-        f"**Failure Type:** {rcr.get('anomaly_result', {}).get('failure_type_prediction', 'N/A')}"
+        f"**Failure Type:** {rcr.get('anomaly_result', {}).get('failure_type_prediction') or 'N/A'}"
     )
 
     evidence = "\n".join(f"• {e}" for e in rcr.get("evidence", [])) or "No evidence recorded."
@@ -348,7 +346,7 @@ def refresh_recent_logs():
 
 def clear_form():
     """Return empty values for all form fields after successful submission."""
-    return "", "HDF", "M", "", "", "", 0.0, "", ""
+    return "", "EVF", "model1", "", "", "", 0.0, "", ""
 
 
 # ── Tab 4: System Health ───────────────────────────────────────────────────────
@@ -530,7 +528,7 @@ def build_app() -> gr.Blocks:
             with gr.TabItem("Live Monitor"):
                 with gr.Row():
                     machine_dd  = gr.Dropdown(label="Machine", choices=get_machine_list(),
-                                              interactive=True, scale=3)
+                                              value=None, interactive=True, scale=3)
                     reload_btn  = gr.Button("Reload Machines", scale=1)
                     refresh_btn = gr.Button("Refresh Now", variant="secondary", scale=1)
 
@@ -628,13 +626,13 @@ def build_app() -> gr.Blocks:
                     t5_machine_id  = gr.Textbox(label="Machine ID *", placeholder="e.g. M042", scale=2)
                     t5_failure_type = gr.Dropdown(
                         label="Failure Type *",
-                        choices=["TWF", "HDF", "PWF", "OSF", "RNF"],
-                        value="HDF", scale=1,
+                        choices=["EVF", "RSF", "PBF", "BWF"],
+                        value="EVF", scale=1,
                     )
                     t5_machine_type = gr.Dropdown(
-                        label="Machine Type",
-                        choices=["L", "M", "H"],
-                        value="M", scale=1,
+                        label="Machine Model",
+                        choices=["model1", "model2", "model3", "model4"],
+                        value="model1", scale=1,
                     )
 
                 t5_symptoms    = gr.Textbox(label="Symptoms *",    lines=3,
@@ -678,7 +676,7 @@ def build_app() -> gr.Blocks:
                     status_html, rows = submit_maintenance_log(*args)
                     # If submission succeeded (green), also clear the form
                     if "22c55e" in status_html:
-                        return status_html, rows, "", "HDF", "M", "", "", "", 0.0, "", ""
+                        return status_html, rows, "", "EVF", "model1", "", "", "", 0.0, "", ""
                     return status_html, rows, *args
 
                 t5_submit_btn.click(

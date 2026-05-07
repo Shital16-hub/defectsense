@@ -248,8 +248,11 @@ class DefectSenseOrchestrator:
                         f"type={anomaly.failure_type_prediction}, "
                         f"prob={anomaly.failure_probability:.3f}"
                     ),
-                    tags=["anomaly", anomaly.failure_type_prediction or "UNKNOWN", state["machine_id"]],
-                    source="orchestrator",
+                    keywords=[
+                        "anomaly",
+                        anomaly.failure_type_prediction or "UNKNOWN",
+                        state["machine_id"],
+                    ],
                 )
             except Exception as exc:
                 logger.warning("Orchestrator[amem] error: {}", exc)
@@ -411,6 +414,7 @@ class DefectSenseOrchestrator:
                 """
                 Convert z-score sensor deltas into natural language symptoms
                 that match the vocabulary of the RAG maintenance corpus.
+                Azure PdM sensors: volt, rotate, pressure, vibration.
                 """
                 if not sensor_deltas:
                     return f"Anomaly detected on {machine_id}"
@@ -420,39 +424,36 @@ class DefectSenseOrchestrator:
 
                 parts: list[str] = []
 
-                pt = sensor_deltas.get("process_temperature", 0.0) or 0.0
-                at = sensor_deltas.get("air_temperature",     0.0) or 0.0
-                rs = sensor_deltas.get("rotational_speed",    0.0) or 0.0
-                tq = sensor_deltas.get("torque",              0.0) or 0.0
-                tw = sensor_deltas.get("tool_wear",           0.0) or 0.0
+                vb = sensor_deltas.get("vibration", 0.0) or 0.0
+                rt = sensor_deltas.get("rotate",    0.0) or 0.0
+                pr = sensor_deltas.get("pressure",  0.0) or 0.0
+                vt = sensor_deltas.get("volt",      0.0) or 0.0
 
-                if abs(pt) >= HIGH_Z:
-                    parts.append(f"Process temperature significantly {'elevated' if pt > 0 else 'below normal'}")
-                elif abs(pt) >= MED_Z:
-                    parts.append(f"Process temperature {'elevated' if pt > 0 else 'below normal'}")
+                if abs(vb) >= HIGH_Z:
+                    parts.append(f"Vibration significantly {'elevated above' if vb > 0 else 'below'} normal threshold")
+                elif abs(vb) >= MED_Z:
+                    parts.append(f"Vibration {'elevated' if vb > 0 else 'below normal'}")
 
-                if abs(at) >= HIGH_Z:
-                    parts.append(f"Air temperature significantly {'elevated' if at > 0 else 'below normal'}")
+                if abs(rt) >= HIGH_Z:
+                    parts.append("Rotation speed dropped significantly below rated RPM" if rt < 0 else "Rotation speed elevated above rated RPM")
+                elif abs(rt) >= MED_Z:
+                    parts.append(f"Rotation speed {'reduced' if rt < 0 else 'increased'}")
 
-                if abs(rs) >= HIGH_Z:
-                    parts.append("Rotational speed dropped significantly below rated RPM" if rs < 0 else "Rotational speed elevated")
-                elif abs(rs) >= MED_Z:
-                    parts.append(f"Rotational speed {'reduced' if rs < 0 else 'increased'}")
+                if abs(pr) >= HIGH_Z:
+                    parts.append("Pressure significantly {'elevated — possible blockage' if pr > 0 else 'below normal'}")
+                elif abs(pr) >= MED_Z:
+                    parts.append(f"Pressure {'above' if pr > 0 else 'below'} normal range")
 
-                if abs(tq) >= HIGH_Z:
-                    parts.append("Torque high — possible mechanical overload" if tq > 0 else "Torque low")
-                elif abs(tq) >= MED_Z:
-                    parts.append(f"Torque {'above' if tq > 0 else 'below'} normal range")
-
-                if abs(tw) >= MED_Z:
-                    parts.append("Tool wear indicator elevated")
+                if abs(vt) >= HIGH_Z:
+                    parts.append("Voltage spike detected — possible electrical overload" if vt > 0 else "Voltage drop detected")
+                elif abs(vt) >= MED_Z:
+                    parts.append(f"Voltage {'elevated' if vt > 0 else 'below normal'}")
 
                 failure_context = {
-                    "HDF": "thermal alarm conditions detected, possible cooling system issue",
-                    "TWF": "tool wear exceeded normal tolerance",
-                    "PWF": "power consumption outside normal operating range",
-                    "OSF": "mechanical overload detected, torque spike recorded",
-                    "RNF": "unexpected fault with no single dominant cause",
+                    "BWF": "bearing vibration elevated above normal threshold",
+                    "RSF": "rotor speed failure — rotation below rated threshold",
+                    "PBF": "pressure blockage detected — possible flow restriction",
+                    "EVF": "electrical overload — voltage spike outside safe range",
                 }
                 if failure_type in failure_context and failure_type != "UNKNOWN":
                     parts.append(failure_context[failure_type])

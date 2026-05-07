@@ -28,7 +28,7 @@ from app.models.sensor import SensorReading
 CHANNEL_SENSOR_FEED     = "sensor:feed"
 CHANNEL_ANOMALY_RESULTS = "defectsense:anomaly_results"
 
-MAX_READINGS  = 50   # keep last 50 per machine (need 30 for LSTM)
+MAX_READINGS  = 210  # keep last 210 per machine (SEQUENCE_LENGTH=198 + headroom)
 MAX_ANOMALIES = 100  # keep last 100 anomalies per machine
 
 
@@ -102,7 +102,7 @@ class RedisService:
             logger.warning("RedisService.store_reading failed: {}", exc)
 
     async def get_recent_readings(
-        self, machine_id: str, n: int = 30
+        self, machine_id: str, n: int = MAX_READINGS
     ) -> list[SensorReading]:
         """
         Return the last `n` SensorReadings for a machine (newest first from LPUSH,

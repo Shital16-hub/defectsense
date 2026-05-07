@@ -32,10 +32,16 @@ class RejectRequest(BaseModel):
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _get_mongo(request: Request):
+    """Require MongoDB — raises 503 for write/lookup endpoints that can't degrade."""
     db = getattr(request.app.state, "mongo_db", None)
     if db is None:
         raise HTTPException(status_code=503, detail="MongoDB unavailable")
     return db
+
+
+def _get_mongo_optional(request: Request):
+    """Return the MongoDB handle or None — allows read endpoints to degrade gracefully."""
+    return getattr(request.app.state, "mongo_db", None)
 
 
 def _get_orchestrator(request: Request):
@@ -55,7 +61,9 @@ async def list_alerts(
     limit:      int                                    = 20,
 ):
     """Return alerts, optionally filtered by machine_id and approval status."""
-    db = _get_mongo(request)
+    db = _get_mongo_optional(request)
+    if db is None:
+        return {"alerts": [], "count": 0, "degraded": True}
 
     filt: dict = {}
     if machine_id:
@@ -75,7 +83,9 @@ async def list_alerts(
 @router.get("/stats")
 async def alert_stats(request: Request):
     """Aggregate alert counts by severity and approval status."""
-    db = _get_mongo(request)
+    db = _get_mongo_optional(request)
+    if db is None:
+        return {"stats": {}, "degraded": True}
 
     pipeline = [
         {

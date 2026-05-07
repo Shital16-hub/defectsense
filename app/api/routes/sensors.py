@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -18,6 +19,11 @@ from app.models.anomaly import AnomalyResult
 from app.models.sensor import SensorReading
 
 router = APIRouter()
+
+# Per-machine cooldown: track when each machine last ran the full pipeline.
+# Keyed by machine_id, value is the UTC datetime of the last pipeline run.
+_last_pipeline_run: dict[str, datetime] = {}
+PIPELINE_COOLDOWN_SECONDS = 30
 
 
 # ── POST /api/sensors/ingest ──────────────────────────────────────────────────
@@ -31,6 +37,10 @@ async def ingest_sensor(reading: SensorReading, request: Request) -> AnomalyResu
     - Logged to MongoDB
     - Cached in Redis
     - Broadcast to all connected WebSocket clients
+
+    The full orchestrator pipeline (context retrieval + LLM root-cause + alert
+    generation) is rate-limited to once every 30 seconds per machine to prevent
+    Groq TPM errors when many anomalous readings arrive in quick succession.
     """
     detector   = request.app.state.detector
     orchestrator = getattr(request.app.state, "orchestrator", None)
@@ -39,15 +49,34 @@ async def ingest_sensor(reading: SensorReading, request: Request) -> AnomalyResu
     result: AnomalyResult = await detector.run(reading)
 
     if result.is_anomaly:
-        # Broadcast raw anomaly to WebSocket clients
+        # Broadcast raw anomaly to WebSocket clients regardless of cooldown
         asyncio.create_task(
             ws_manager.broadcast(result.model_dump(mode="json"))
         )
-        # Kick off full pipeline: root cause → alert (non-blocking)
-        if orchestrator is not None:
+        # Rate-limit the expensive LLM pipeline per machine
+        if orchestrator is not None and _pipeline_allowed(reading.machine_id):
             asyncio.create_task(_run_pipeline(orchestrator, reading))
 
     return result
+
+
+def _pipeline_allowed(machine_id: str) -> bool:
+    """
+    Return True if enough time has elapsed since the last pipeline run for
+    this machine, and update the tracking dict if so.
+    """
+    now  = datetime.now(tz=timezone.utc)
+    last = _last_pipeline_run.get(machine_id)
+    if last is not None:
+        elapsed = (now - last).total_seconds()
+        if elapsed < PIPELINE_COOLDOWN_SECONDS:
+            logger.debug(
+                "Pipeline cooldown: skipping for machine={} ({:.1f}s < {}s)",
+                machine_id, elapsed, PIPELINE_COOLDOWN_SECONDS,
+            )
+            return False
+    _last_pipeline_run[machine_id] = now
+    return True
 
 
 async def _run_pipeline(orchestrator, reading: SensorReading) -> None:
