@@ -53,9 +53,12 @@ async def ingest_sensor(reading: SensorReading, request: Request) -> AnomalyResu
         asyncio.create_task(
             ws_manager.broadcast(result.model_dump(mode="json"))
         )
-        # Rate-limit the expensive LLM pipeline per machine
+        # Rate-limit the expensive LLM pipeline per machine.
+        # Pass the pre-computed result so the orchestrator does not re-detect
+        # (re-detection would store the reading twice, shifting z-scores and
+        # potentially losing the failure_type_prediction classification).
         if orchestrator is not None and _pipeline_allowed(reading.machine_id):
-            asyncio.create_task(_run_pipeline(orchestrator, reading))
+            asyncio.create_task(_run_pipeline(orchestrator, reading, result))
 
     return result
 
@@ -79,10 +82,14 @@ def _pipeline_allowed(machine_id: str) -> bool:
     return True
 
 
-async def _run_pipeline(orchestrator, reading: SensorReading) -> None:
+async def _run_pipeline(
+    orchestrator,
+    reading: SensorReading,
+    anomaly_result: AnomalyResult | None = None,
+) -> None:
     """Background task: run full orchestrator pipeline for an anomaly."""
     try:
-        state = await orchestrator.run(reading)
+        state = await orchestrator.run(reading, anomaly_result=anomaly_result)
         alert = state.get("alert")
         if alert:
             logger.info(

@@ -139,6 +139,7 @@ class DefectSenseOrchestrator:
         self,
         reading: SensorReading,
         session_id: Optional[str] = None,
+        anomaly_result: Optional[AnomalyResult] = None,
     ) -> dict:
         """
         Run pipeline for one reading.
@@ -146,6 +147,12 @@ class DefectSenseOrchestrator:
         Alert is saved to MongoDB with approved=None before the interrupt.
         Returns state dict including thread_id.
         If confidence >= auto_threshold, immediately auto-approves.
+
+        Args:
+            anomaly_result: Pre-computed AnomalyResult from the ingest route.
+                            When supplied, _node_detect_anomaly skips re-detection
+                            so the failure_type_prediction classification is preserved
+                            and the reading is not stored to Redis a second time.
         """
         if self._graph is None:
             self.build()
@@ -156,14 +163,17 @@ class DefectSenseOrchestrator:
 
         logger.info("Orchestrator: run | machine={} thread={}", reading.machine_id, thread_id)
 
-        final_state = await self._graph.ainvoke(
-            {
-                "reading":    reading,
-                "session_id": sid,
-                "machine_id": reading.machine_id,
-            },
-            config=config,
-        )
+        initial_state: dict = {
+            "reading":    reading,
+            "session_id": sid,
+            "machine_id": reading.machine_id,
+        }
+        if anomaly_result is not None:
+            # Pre-populate so _node_detect_anomaly can skip re-detection
+            initial_state["anomaly_result"] = anomaly_result
+            initial_state["is_anomaly"]     = anomaly_result.is_anomaly
+
+        final_state = await self._graph.ainvoke(initial_state, config=config)
 
         # Graph paused before apply_approval — decide auto-approve or wait
         report: Optional[RootCauseReport] = final_state.get("root_cause_report")
@@ -218,12 +228,27 @@ class DefectSenseOrchestrator:
     # ── Nodes ──────────────────────────────────────────────────────────────────
 
     async def _node_detect_anomaly(self, state: PipelineState) -> dict:
+        # If a pre-computed result was injected by the ingest route, use it
+        # directly instead of re-running detection.  Re-detection would store
+        # the reading to Redis a second time, shifting z-scores and potentially
+        # losing the failure_type_prediction that was already classified.
+        if state.get("anomaly_result") is not None:
+            result: AnomalyResult = state["anomaly_result"]
+            logger.debug(
+                "Orchestrator[detect]: reusing pre-computed result "
+                "machine={} anomaly={} type={} prob={:.3f}",
+                result.machine_id, result.is_anomaly,
+                result.failure_type_prediction, result.failure_probability,
+            )
+            return {}   # state already has anomaly_result + is_anomaly; no update needed
+
         reading = state["reading"]
         try:
-            result: AnomalyResult = await self._detector.run(reading)
+            result = await self._detector.run(reading)
             logger.debug(
-                "Orchestrator[detect]: machine={} anomaly={} prob={:.3f}",
-                reading.machine_id, result.is_anomaly, result.failure_probability,
+                "Orchestrator[detect]: machine={} anomaly={} type={} prob={:.3f}",
+                reading.machine_id, result.is_anomaly,
+                result.failure_type_prediction, result.failure_probability,
             )
             return {"anomaly_result": result, "is_anomaly": result.is_anomaly}
         except Exception as exc:
@@ -440,7 +465,7 @@ class DefectSenseOrchestrator:
                     parts.append(f"Rotation speed {'reduced' if rt < 0 else 'increased'}")
 
                 if abs(pr) >= HIGH_Z:
-                    parts.append("Pressure significantly {'elevated — possible blockage' if pr > 0 else 'below normal'}")
+                    parts.append(f"Pressure significantly {'elevated — possible blockage' if pr > 0 else 'below normal'}")
                 elif abs(pr) >= MED_Z:
                     parts.append(f"Pressure {'above' if pr > 0 else 'below'} normal range")
 
